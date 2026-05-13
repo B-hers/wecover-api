@@ -31,9 +31,9 @@ app.add_middleware(
 async def root():
     return {
         "service": "WeCover API",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "status": "running",
-        "endpoints": ["/api/cadastre", "/api/analyze"],
+        "endpoints": ["/api/cadastre", "/api/analyze", "/api/detect-edges"],
     }
 
 
@@ -125,6 +125,19 @@ class AnalyzeRequest(BaseModel):
     zoom: int = 21
     image_width: int = 640
     image_height: int = 640
+
+
+class EdgeDetectRequest(BaseModel):
+    lat: float
+    lng: float
+    zoom: Optional[int] = 21
+    source: Optional[str] = "auto"          # auto | wallonia | google
+    canny_low: Optional[int] = 50
+    canny_high: Optional[int] = 150
+    hough_threshold: Optional[int] = 80
+    min_line_px: Optional[int] = 40
+    max_line_gap: Optional[int] = 10
+    min_length_m: Optional[float] = 2.5
 
 
 @app.post("/api/analyze")
@@ -233,8 +246,132 @@ JSON UNIQUEMENT :
 
 
 @app.post("/api/detect-edges")
-async def detect_edges():
-    return {"status": "not_implemented_yet", "phase": 3}
+async def detect_edges(req: EdgeDetectRequest):
+    """
+    Détection d'arêtes de toiture via OpenCV Canny + Hough.
+    Source : orthophoto IGN belge (Wallonie WMS) ou Google Static Maps.
+    Retourne les lignes droites en lat/lng, filtrées (longueur ≥ 2m).
+    """
+    import io, math
+    from PIL import Image
+    import numpy as np
+    import cv2
+
+    lat, lng = req.lat, req.lng
+    zoom = req.zoom or 21
+    W, H = 1024, 1024
+
+    # Image bbox in degrees
+    latM = 111320
+    lngM = 111320 * math.cos(math.radians(lat))
+    dlat = (H / 2) / latM
+    dlng = (W / 2) / lngM
+
+    # Choose imagery source
+    if req.source == "wallonia" or (req.source == "auto" and lat < 50.78):
+        # Géoportail Wallon ORTHO 2021, 25 cm native
+        img_url = (
+            "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_2021/MapServer/WMSServer"
+            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=0&STYLES=&FORMAT=image/jpeg"
+            f"&CRS=EPSG:4326&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
+            f"&WIDTH={W}&HEIGHT={H}"
+        )
+        source_used = "wallonia-ign-25cm"
+    else:
+        # Fallback : Google Static Maps satellite
+        gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if not gkey:
+            raise HTTPException(status_code=400, detail="Pas d'orthophoto IGN disponible et GOOGLE_MAPS_API_KEY non configuré")
+        img_url = (
+            f"https://maps.googleapis.com/maps/api/staticmap?"
+            f"center={lat},{lng}&zoom={zoom}&size={W//2}x{H//2}&scale=2"
+            f"&maptype=satellite&key={gkey}"
+        )
+        source_used = "google-satellite"
+
+    # Download image
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            r = await client.get(img_url)
+            r.raise_for_status()
+            img_bytes = r.content
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Image fetch failed: {e}")
+
+    # Decode and grayscale
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("L")
+        np_img = np.array(img)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image decode failed: {e}")
+
+    # CLAHE for contrast (helps with low-contrast roofs)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    np_img = clahe.apply(np_img)
+
+    # Gaussian blur to reduce noise (panels create thin sharp edges we want to skip later)
+    blurred = cv2.GaussianBlur(np_img, (5, 5), 1.0)
+
+    # Canny edge detection
+    canny_low = req.canny_low or 50
+    canny_high = req.canny_high or 150
+    edges = cv2.Canny(blurred, canny_low, canny_high, apertureSize=3)
+
+    # Hough probabilistic line transform
+    hough_thresh = req.hough_threshold or 80
+    min_line_px = req.min_line_px or 40       # ~10 m at zoom 21 in Belgium
+    max_gap_px = req.max_line_gap or 10
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1, theta=np.pi / 180,
+        threshold=hough_thresh,
+        minLineLength=min_line_px,
+        maxLineGap=max_gap_px,
+    )
+
+    if lines is None:
+        return {"lines": [], "count": 0, "source": source_used, "image_size": [W, H]}
+
+    # Convert pixel coords back to lat/lng
+    def px_to_ll(px, py):
+        latv = lat + dlat - (py / H) * 2 * dlat
+        lngv = lng - dlng + (px / W) * 2 * dlng
+        return latv, lngv
+
+    min_length_m = req.min_length_m or 2.5
+    result = []
+    for line in lines:
+        x1, y1, x2, y2 = [int(v) for v in line[0]]
+        lat1, lng1 = px_to_ll(x1, y1)
+        lat2, lng2 = px_to_ll(x2, y2)
+        dx = (lng2 - lng1) * lngM
+        dy = (lat2 - lat1) * latM
+        length_m = math.sqrt(dx * dx + dy * dy)
+        if length_m < min_length_m:
+            continue
+        # Angle 0–180° (line direction)
+        angle = (math.degrees(math.atan2(dy, dx)) + 180) % 180
+        result.append({
+            "lat1": round(lat1, 7),
+            "lng1": round(lng1, 7),
+            "lat2": round(lat2, 7),
+            "lng2": round(lng2, 7),
+            "length_m": round(length_m, 2),
+            "angle_deg": round(angle, 1),
+        })
+
+    # Sort by length descending → strongest edges first
+    result.sort(key=lambda x: -x["length_m"])
+
+    return {
+        "lines": result,
+        "count": len(result),
+        "raw_count": len(lines),
+        "source": source_used,
+        "image_size": [W, H],
+        "filters": {"min_length_m": min_length_m, "canny": [canny_low, canny_high]},
+    }
 
 
 @app.post("/api/roof-solver")
