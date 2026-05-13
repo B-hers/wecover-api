@@ -249,8 +249,8 @@ JSON UNIQUEMENT :
 async def detect_edges(req: EdgeDetectRequest):
     """
     Détection d'arêtes de toiture via OpenCV Canny + Hough.
-    Source : orthophoto IGN belge (Wallonie WMS) ou Google Static Maps.
-    Retourne les lignes droites en lat/lng, filtrées (longueur ≥ 2m).
+    Sources : orthophoto IGN Wallonie / Geopunt Flandre / Google Static Maps fallback.
+    Filtre les panneaux solaires (lignes en grille régulière) mais GARDE les lucarnes et chiens-assis.
     """
     import io, math
     from PIL import Image
@@ -261,15 +261,28 @@ async def detect_edges(req: EdgeDetectRequest):
     zoom = req.zoom or 21
     W, H = 1024, 1024
 
-    # Image bbox in degrees
+    # Bbox de l'image en degrés (approximation locale Belgique)
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
     dlat = (H / 2) / latM
     dlng = (W / 2) / lngM
 
-    # Choose imagery source
-    if req.source == "wallonia" or (req.source == "auto" and lat < 50.78):
-        # Géoportail Wallon ORTHO 2021, 25 cm native
+    # ── Sélection source imagery ──────────────────────────────────────
+    # Auto-détection région par bounds approximatives
+    region = req.source
+    if region == "auto":
+        # Bruxelles : lat 50.76-50.92, lng 4.24-4.49
+        if 50.76 < lat < 50.92 and 4.24 < lng < 4.49:
+            region = "brussels"
+        # Flandre : nord de 50.78, ouest de 5.92
+        elif lat > 50.78 and lng < 5.92:
+            region = "flanders"
+        else:
+            region = "wallonia"
+
+    img_url = None
+    source_used = None
+    if region == "wallonia":
         img_url = (
             "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_2021/MapServer/WMSServer"
             f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=0&STYLES=&FORMAT=image/jpeg"
@@ -277,70 +290,97 @@ async def detect_edges(req: EdgeDetectRequest):
             f"&WIDTH={W}&HEIGHT={H}"
         )
         source_used = "wallonia-ign-25cm"
-    else:
-        # Fallback : Google Static Maps satellite
+    elif region == "flanders":
+        img_url = (
+            "https://geo.api.vlaanderen.be/OMWRGBMRVL/wms"
+            f"?service=WMS&version=1.3.0&request=GetMap&layers=omwrgbmrvl"
+            f"&styles=&format=image/jpeg&CRS=EPSG:4326"
+            f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}&WIDTH={W}&HEIGHT={H}"
+        )
+        source_used = "flanders-geopunt-25cm"
+
+    # Fallback Google Static Maps (Bruxelles ou échec WMS)
+    if not img_url or region == "brussels":
         gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
         if not gkey:
-            raise HTTPException(status_code=400, detail="Pas d'orthophoto IGN disponible et GOOGLE_MAPS_API_KEY non configuré")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Région {region} : pas d'orthophoto WMS et GOOGLE_MAPS_API_KEY non configuré"
+            )
         img_url = (
             f"https://maps.googleapis.com/maps/api/staticmap?"
             f"center={lat},{lng}&zoom={zoom}&size={W//2}x{H//2}&scale=2"
             f"&maptype=satellite&key={gkey}"
         )
-        source_used = "google-satellite"
+        source_used = source_used or "google-satellite"
 
-    # Download image
+    # ── Téléchargement avec fallback Google si WMS échoue ─────────────
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             r = await client.get(img_url)
             r.raise_for_status()
             img_bytes = r.content
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Image fetch failed: {e}")
+            # Fallback automatique sur Google si WMS national échoue
+            gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+            if gkey and "google" not in source_used:
+                fallback_url = (
+                    f"https://maps.googleapis.com/maps/api/staticmap?"
+                    f"center={lat},{lng}&zoom={zoom}&size={W//2}x{H//2}&scale=2"
+                    f"&maptype=satellite&key={gkey}"
+                )
+                try:
+                    r = await client.get(fallback_url)
+                    r.raise_for_status()
+                    img_bytes = r.content
+                    source_used = source_used + "+fallback-google"
+                except Exception as e2:
+                    raise HTTPException(status_code=502, detail=f"Image fetch failed (WMS + Google): {e2}")
+            else:
+                raise HTTPException(status_code=502, detail=f"Image fetch failed: {e}")
 
-    # Decode and grayscale
+    # ── Décodage et prétraitement ─────────────────────────────────────
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("L")
         np_img = np.array(img)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image decode failed: {e}")
 
-    # CLAHE for contrast (helps with low-contrast roofs)
+    # CLAHE pour rehausser le contraste local
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     np_img = clahe.apply(np_img)
 
-    # Gaussian blur to reduce noise (panels create thin sharp edges we want to skip later)
+    # Flou gaussien anti-bruit
     blurred = cv2.GaussianBlur(np_img, (5, 5), 1.0)
 
-    # Canny edge detection
+    # Canny
     canny_low = req.canny_low or 50
     canny_high = req.canny_high or 150
     edges = cv2.Canny(blurred, canny_low, canny_high, apertureSize=3)
 
-    # Hough probabilistic line transform
-    hough_thresh = req.hough_threshold or 80
-    min_line_px = req.min_line_px or 40       # ~10 m at zoom 21 in Belgium
+    # Hough probabiliste
+    hough_thresh = req.hough_threshold or 70
+    min_line_px = req.min_line_px or 25      # ~5-6m à zoom 21 en Belgique
     max_gap_px = req.max_line_gap or 10
 
     lines = cv2.HoughLinesP(
-        edges,
-        rho=1, theta=np.pi / 180,
+        edges, rho=1, theta=np.pi / 180,
         threshold=hough_thresh,
         minLineLength=min_line_px,
         maxLineGap=max_gap_px,
     )
 
     if lines is None:
-        return {"lines": [], "count": 0, "source": source_used, "image_size": [W, H]}
+        return {"lines": [], "panels": [], "count": 0, "source": source_used, "image_size": [W, H]}
 
-    # Convert pixel coords back to lat/lng
+    # ── Conversion pixels → lat/lng ───────────────────────────────────
     def px_to_ll(px, py):
         latv = lat + dlat - (py / H) * 2 * dlat
         lngv = lng - dlng + (px / W) * 2 * dlng
         return latv, lngv
 
-    min_length_m = req.min_length_m or 2.5
-    result = []
+    min_length_m = req.min_length_m or 1.0   # ↓ Garde lucarnes/chiens-assis (>1m)
+    raw_lines = []
     for line in lines:
         x1, y1, x2, y2 = [int(v) for v in line[0]]
         lat1, lng1 = px_to_ll(x1, y1)
@@ -350,27 +390,79 @@ async def detect_edges(req: EdgeDetectRequest):
         length_m = math.sqrt(dx * dx + dy * dy)
         if length_m < min_length_m:
             continue
-        # Angle 0–180° (line direction)
         angle = (math.degrees(math.atan2(dy, dx)) + 180) % 180
-        result.append({
-            "lat1": round(lat1, 7),
-            "lng1": round(lng1, 7),
-            "lat2": round(lat2, 7),
-            "lng2": round(lng2, 7),
+        # Centre en mètres pour clustering
+        cx = ((lng1 + lng2) / 2) * lngM
+        cy = ((lat1 + lat2) / 2) * latM
+        raw_lines.append({
+            "lat1": round(lat1, 7), "lng1": round(lng1, 7),
+            "lat2": round(lat2, 7), "lng2": round(lng2, 7),
             "length_m": round(length_m, 2),
             "angle_deg": round(angle, 1),
+            "_cx": cx, "_cy": cy,
         })
 
-    # Sort by length descending → strongest edges first
-    result.sort(key=lambda x: -x["length_m"])
+    # ── Filtre panneaux solaires : grille parallèle régulière ─────────
+    # Heuristique : un panneau solaire = ligne courte (<2.5m) ayant 3+ voisins
+    # parallèles (±8°) à moins de 2.5m. Les lucarnes/chiens-assis sont isolés.
+    panel_indices = set()
+    PANEL_MAX_LEN = 2.5
+    PARALLEL_TOL_DEG = 8
+    NEIGHBOR_RADIUS_M = 2.5
+    MIN_NEIGHBORS = 3
+
+    for i, li in enumerate(raw_lines):
+        if li["length_m"] > PANEL_MAX_LEN:
+            continue  # ligne longue = pas un panneau
+        cnt = 0
+        for j, lj in enumerate(raw_lines):
+            if i == j or lj["length_m"] > PANEL_MAX_LEN:
+                continue
+            # Parallélisme
+            adiff = abs(li["angle_deg"] - lj["angle_deg"])
+            adiff = min(adiff, 180 - adiff)
+            if adiff > PARALLEL_TOL_DEG:
+                continue
+            # Distance entre centres
+            ddx = li["_cx"] - lj["_cx"]
+            ddy = li["_cy"] - lj["_cy"]
+            if math.sqrt(ddx * ddx + ddy * ddy) > NEIGHBOR_RADIUS_M:
+                continue
+            cnt += 1
+        if cnt >= MIN_NEIGHBORS:
+            panel_indices.add(i)
+
+    # Séparer résultats
+    keep_lines, panel_lines = [], []
+    for i, li in enumerate(raw_lines):
+        out = {k: v for k, v in li.items() if not k.startswith("_")}
+        if i in panel_indices:
+            panel_lines.append(out)
+        else:
+            keep_lines.append(out)
+
+    # Tri par longueur décroissante
+    keep_lines.sort(key=lambda x: -x["length_m"])
+    panel_lines.sort(key=lambda x: -x["length_m"])
 
     return {
-        "lines": result,
-        "count": len(result),
-        "raw_count": len(lines),
+        "lines": keep_lines,           # arêtes principales + lucarnes/chiens-assis
+        "panels": panel_lines,         # lignes identifiées comme panneaux solaires
+        "count": len(keep_lines),
+        "panel_count": len(panel_lines),
+        "raw_count": len(raw_lines),
         "source": source_used,
         "image_size": [W, H],
-        "filters": {"min_length_m": min_length_m, "canny": [canny_low, canny_high]},
+        "filters": {
+            "min_length_m": min_length_m,
+            "canny": [canny_low, canny_high],
+            "panel_detection": {
+                "max_length_m": PANEL_MAX_LEN,
+                "parallel_tol_deg": PARALLEL_TOL_DEG,
+                "neighbor_radius_m": NEIGHBOR_RADIUS_M,
+                "min_neighbors": MIN_NEIGHBORS,
+            },
+        },
     }
 
 
