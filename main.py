@@ -175,6 +175,25 @@ async def analyze_roof(req: AnalyzeRequest):
             f"→ Tous les pans DOIVENT être dans cette emprise. Couvre toute l'emprise."
         )
 
+    # Si le frontend n'a pas pu capturer l'image (CORS/referrer), on tente côté backend
+    if not req.image_base64:
+        gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if gkey:
+            import base64
+            img_url = (
+                f"https://maps.googleapis.com/maps/api/staticmap?"
+                f"center={req.lat},{req.lng}&zoom={req.zoom}&size={req.image_width}x{req.image_height}"
+                f"&scale=2&maptype=satellite&key={gkey}"
+            )
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    r = await client.get(img_url)
+                    r.raise_for_status()
+                    req.image_base64 = base64.b64encode(r.content).decode("ascii")
+            except Exception as e:
+                # On laisse req.image_base64 à None → fallback mode GPS-only
+                pass
+
     has_image = bool(req.image_base64)
 
     if has_image:
