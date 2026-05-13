@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import anthropic
 
-app = FastAPI(title="WeCover API", version="0.2.0")
+app = FastAPI(title="WeCover API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,9 +31,9 @@ app.add_middleware(
 async def root():
     return {
         "service": "WeCover API",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "status": "running",
-        "endpoints": ["/api/cadastre", "/api/analyze", "/api/detect-edges"],
+        "endpoints": ["/api/cadastre", "/api/analyze", "/api/detect-edges", "/api/refine-footprint"],
     }
 
 
@@ -131,13 +131,24 @@ class EdgeDetectRequest(BaseModel):
     lat: float
     lng: float
     zoom: Optional[int] = 21
-    source: Optional[str] = "auto"          # auto | wallonia | google
+    source: Optional[str] = "auto"
     canny_low: Optional[int] = 50
     canny_high: Optional[int] = 150
     hough_threshold: Optional[int] = 80
     min_line_px: Optional[int] = 40
     max_line_gap: Optional[int] = 10
     min_length_m: Optional[float] = 2.5
+    building_footprint: Optional[List[dict]] = None   # [{lat,lng}] — filtre les lignes au bâtiment
+
+
+class RefineFootprintRequest(BaseModel):
+    lat: float
+    lng: float
+    label: Optional[str] = ""
+    region: Optional[str] = "auto"
+    osm_footprint: List[dict]    # [{lat,lng}] — polygone OSM à affiner
+    zoom: Optional[int] = 21
+    image_base64: Optional[str] = None   # image satellite optionnelle (sinon backend la fetch)
 
 
 @app.post("/api/analyze")
@@ -413,17 +424,15 @@ async def detect_edges(req: EdgeDetectRequest):
 
     for i, li in enumerate(raw_lines):
         if li["length_m"] > PANEL_MAX_LEN:
-            continue  # ligne longue = pas un panneau
+            continue
         cnt = 0
         for j, lj in enumerate(raw_lines):
             if i == j or lj["length_m"] > PANEL_MAX_LEN:
                 continue
-            # Parallélisme
             adiff = abs(li["angle_deg"] - lj["angle_deg"])
             adiff = min(adiff, 180 - adiff)
             if adiff > PARALLEL_TOL_DEG:
                 continue
-            # Distance entre centres
             ddx = li["_cx"] - lj["_cx"]
             ddy = li["_cy"] - lj["_cy"]
             if math.sqrt(ddx * ddx + ddy * ddy) > NEIGHBOR_RADIUS_M:
@@ -432,30 +441,94 @@ async def detect_edges(req: EdgeDetectRequest):
         if cnt >= MIN_NEIGHBORS:
             panel_indices.add(i)
 
+    # ── Filtre par proximité au bâtiment cadastral (si fourni) ────────
+    # On garde uniquement les lignes dont au moins UNE extrémité est à
+    # moins de FOOTPRINT_MARGIN_M du polygone cadastral.
+    FOOTPRINT_MARGIN_M = 5.0
+    far_indices = set()
+    if req.building_footprint and len(req.building_footprint) >= 3:
+        # Convertir le footprint en mètres relatifs au centre
+        fp_m = [
+            ((p["lng"] - lng) * lngM, (p["lat"] - lat) * latM)
+            for p in req.building_footprint
+        ]
+
+        def dist_point_to_polygon_m(px_m, py_m):
+            """Distance min d'un point au polygone (mètres). 0 si à l'intérieur."""
+            # Point-in-polygon (ray casting)
+            inside = False
+            n = len(fp_m)
+            j = n - 1
+            for k in range(n):
+                xi, yi = fp_m[k]
+                xj, yj = fp_m[j]
+                if ((yi > py_m) != (yj > py_m)) and \
+                   (px_m < (xj - xi) * (py_m - yi) / (yj - yi + 1e-12) + xi):
+                    inside = not inside
+                j = k
+            if inside:
+                return 0.0
+            # Distance min aux segments
+            min_d = float("inf")
+            for k in range(n):
+                ax, ay = fp_m[k]
+                bx, by = fp_m[(k + 1) % n]
+                dx, dy = bx - ax, by - ay
+                ll = dx * dx + dy * dy
+                if ll == 0:
+                    d = math.hypot(px_m - ax, py_m - ay)
+                else:
+                    t = max(0, min(1, ((px_m - ax) * dx + (py_m - ay) * dy) / ll))
+                    proj_x = ax + t * dx
+                    proj_y = ay + t * dy
+                    d = math.hypot(px_m - proj_x, py_m - proj_y)
+                if d < min_d:
+                    min_d = d
+            return min_d
+
+        for i, li in enumerate(raw_lines):
+            cx_m = li["_cx"]
+            cy_m = li["_cy"]
+            # Convertir extrémités en mètres relatifs au centre
+            p1x = (li["lng1"] - lng) * lngM
+            p1y = (li["lat1"] - lat) * latM
+            p2x = (li["lng2"] - lng) * lngM
+            p2y = (li["lat2"] - lat) * latM
+            # Au moins une extrémité ou le centre doit être proche
+            d1 = dist_point_to_polygon_m(p1x, p1y)
+            d2 = dist_point_to_polygon_m(p2x, p2y)
+            dc = dist_point_to_polygon_m(cx_m, cy_m)
+            if min(d1, d2, dc) > FOOTPRINT_MARGIN_M:
+                far_indices.add(i)
+
     # Séparer résultats
     keep_lines, panel_lines = [], []
+    excluded_count = len(far_indices)
     for i, li in enumerate(raw_lines):
+        if i in far_indices:
+            continue  # trop loin du bâtiment
         out = {k: v for k, v in li.items() if not k.startswith("_")}
         if i in panel_indices:
             panel_lines.append(out)
         else:
             keep_lines.append(out)
 
-    # Tri par longueur décroissante
     keep_lines.sort(key=lambda x: -x["length_m"])
     panel_lines.sort(key=lambda x: -x["length_m"])
 
     return {
-        "lines": keep_lines,           # arêtes principales + lucarnes/chiens-assis
-        "panels": panel_lines,         # lignes identifiées comme panneaux solaires
+        "lines": keep_lines,
+        "panels": panel_lines,
         "count": len(keep_lines),
         "panel_count": len(panel_lines),
         "raw_count": len(raw_lines),
+        "filtered_far_count": excluded_count,
         "source": source_used,
         "image_size": [W, H],
         "filters": {
             "min_length_m": min_length_m,
             "canny": [canny_low, canny_high],
+            "footprint_margin_m": FOOTPRINT_MARGIN_M if req.building_footprint else None,
             "panel_detection": {
                 "max_length_m": PANEL_MAX_LEN,
                 "parallel_tol_deg": PARALLEL_TOL_DEG,
@@ -464,6 +537,124 @@ async def detect_edges(req: EdgeDetectRequest):
             },
         },
     }
+
+
+# ────────────────────────────────────────────────────────────
+# /api/refine-footprint — Claude affine le polygone cadastral OSM
+# ────────────────────────────────────────────────────────────
+@app.post("/api/refine-footprint")
+async def refine_footprint(req: RefineFootprintRequest):
+    """
+    Prend le polygone OSM cadastral (70-80% précis) + image satellite,
+    demande à Claude de raffiner le contour pour qu'il colle EXACTEMENT
+    à la toiture visible.
+    """
+    import io, math, json, re
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+
+    if not req.osm_footprint or len(req.osm_footprint) < 3:
+        raise HTTPException(status_code=400, detail="osm_footprint requis (>= 3 sommets)")
+
+    lat, lng = req.lat, req.lng
+    zoom = req.zoom or 21
+    W, H = 640, 640
+    latM = 111320
+    lngM = 111320 * math.cos(math.radians(lat))
+
+    # Capture image si pas fournie
+    img_b64 = req.image_base64
+    if not img_b64:
+        gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if not gkey:
+            raise HTTPException(status_code=400, detail="image_base64 ou GOOGLE_MAPS_API_KEY requis")
+        img_url = (
+            f"https://maps.googleapis.com/maps/api/staticmap?"
+            f"center={lat},{lng}&zoom={zoom}&size={W}x{H}&scale=2"
+            f"&maptype=satellite&key={gkey}"
+        )
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(img_url)
+            r.raise_for_status()
+            import base64
+            img_b64 = base64.b64encode(r.content).decode("ascii")
+
+    # Convertir le footprint en offsets mètres pour Claude
+    fp_meters = [
+        {
+            "east_m": round((p["lng"] - lng) * lngM, 2),
+            "north_m": round((p["lat"] - lat) * latM, 2),
+        }
+        for p in req.osm_footprint
+    ]
+
+    prompt = f"""Tu affines un polygone cadastral OSM pour qu'il colle EXACTEMENT à la toiture visible sur l'image satellite.
+
+ADRESSE : {req.label or f"{lat},{lng}"}
+IMAGE : {W}×{H}px centrée sur ({lat:.6f}, {lng:.6f})
+
+POLYGONE OSM ACTUEL (à affiner — {len(fp_meters)} sommets, ~70-80% précis) :
+{json.dumps(fp_meters, indent=2)}
+
+MISSION : Retourne un polygone affiné dont les sommets coïncident PRÉCISÉMENT avec les arêtes externes de la toiture (gouttières, débords, pignons) visibles dans l'image.
+
+RÈGLES :
+1. Garde la forme générale du polygone OSM (même topologie L, U, rectangle, etc.)
+2. Ajuste chaque sommet pour qu'il tombe sur une vraie arête de toiture visible
+3. Ajoute des sommets supplémentaires si la toiture a des décrochements non capturés par OSM
+4. Supprime les sommets aberrants (sortie OSM imprécise)
+5. Conserve les angles ~90° quand le bâtiment est orthogonal
+6. Le polygone final doit être fermé (premier sommet = dernier ignoré, le système ferme automatiquement)
+
+Réponds UNIQUEMENT en JSON valide :
+{{
+  "refined_footprint": [
+    {{"east_m": 0.0, "north_m": 0.0}},
+    ...
+  ],
+  "confidence": 0.85,
+  "notes": "Ajustement de 4 sommets sur la façade rue, ajout d'un décrochement arrière"
+}}"""
+
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+        {"type": "text", "text": prompt},
+    ]
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": content}],
+        )
+        text = message.content[0].text if message.content else ""
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            raise HTTPException(status_code=502, detail=f"AI non-JSON: {text[:200]}")
+        result = json.loads(m.group(0))
+
+        # Convertir refined_footprint en lat/lng pour le frontend
+        refined_ll = []
+        for p in result.get("refined_footprint", []):
+            refined_ll.append({
+                "lat": lat + p["north_m"] / latM,
+                "lng": lng + p["east_m"] / lngM,
+            })
+
+        return {
+            "refined_footprint": refined_ll,
+            "refined_count": len(refined_ll),
+            "original_count": len(req.osm_footprint),
+            "confidence": result.get("confidence"),
+            "notes": result.get("notes", ""),
+        }
+
+    except anthropic.APIError as e:
+        raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/roof-solver")
