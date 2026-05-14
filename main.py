@@ -1,119 +1,36 @@
-"""
-WeCover API — Backend pour l'outil de mesure de toiture
-Déployé sur Render.com
-"""
+# WeCover Backend API v0.5.0
+# Belgian-only orthophoto sources (Wallonia, Flanders) — no Google Static Maps dependency
+# Endpoints: /api/cadastre, /api/analyze, /api/detect-edges, /api/refine-footprint
 
 import os
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+import anthropic
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
-import anthropic
 
-app = FastAPI(title="WeCover API", version="0.4.0")
+app = FastAPI(title="WeCover API", version="0.5.0")
 
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://b-hers.github.io",
-        "http://localhost:8000",
-        "http://localhost:3000",
-        "http://127.0.0.1:5500",
-        "null",
-    ],
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/")
-async def root():
-    return {
-        "service": "WeCover API",
-        "version": "0.4.0",
-        "status": "running",
-        "endpoints": ["/api/cadastre", "/api/analyze", "/api/detect-edges", "/api/refine-footprint"],
-    }
+# ════════════════════════════════════════════════════════════════════════
+# SCHEMAS
+# ════════════════════════════════════════════════════════════════════════
+
+class CadastreRequest(BaseModel):
+    lat: float
+    lng: float
 
 
-# ────────────────────────────────────────────────────────────
-# /api/cadastre — OSM Overpass (couvre toute la Belgique)
-# ────────────────────────────────────────────────────────────
-@app.get("/api/cadastre")
-async def get_cadastre(
-    lat: float = Query(...),
-    lng: float = Query(...),
-    region: str = Query("auto"),
-    delta: float = Query(0.0008),
-):
-    south, west = lat - delta, lng - delta
-    north, east = lat + delta, lng + delta
-
-    overpass_query = f"""
-    [out:json][timeout:15];
-    (
-      way["building"]({south},{west},{north},{east});
-      relation["building"]({south},{west},{north},{east});
-    );
-    out body;
-    >;
-    out skel qt;
-    """
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            r = await client.post(
-                "https://overpass-api.de/api/interpreter",
-                data={"data": overpass_query},
-                headers={"User-Agent": "WeCover/0.2"},
-            )
-            r.raise_for_status()
-            osm_data = r.json()
-            geojson = osm_to_geojson(osm_data)
-            return {
-                "type": "osm-buildings",
-                "data": geojson,
-                "count": len(geojson["features"]),
-            }
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"OSM error: {e.response.status_code}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Cadastre error: {str(e)}")
-
-
-def osm_to_geojson(osm_data: dict) -> dict:
-    nodes = {n["id"]: (n["lon"], n["lat"]) for n in osm_data.get("elements", []) if n.get("type") == "node"}
-    features = []
-    for el in osm_data.get("elements", []):
-        if el.get("type") != "way" or "building" not in el.get("tags", {}):
-            continue
-        node_ids = el.get("nodes", [])
-        if len(node_ids) < 4:
-            continue
-        coords = [nodes.get(nid) for nid in node_ids if nid in nodes]
-        coords = [c for c in coords if c is not None]
-        if len(coords) < 4:
-            continue
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-        features.append({
-            "type": "Feature",
-            "properties": {
-                "osm_id": el["id"],
-                "building": el["tags"].get("building", "yes"),
-                "name": el["tags"].get("name", ""),
-                "addr_street": el["tags"].get("addr:street", ""),
-                "addr_housenumber": el["tags"].get("addr:housenumber", ""),
-            },
-            "geometry": {"type": "Polygon", "coordinates": [coords]},
-        })
-    return {"type": "FeatureCollection", "features": features}
-
-
-# ────────────────────────────────────────────────────────────
-# /api/analyze — Claude vision
-# ────────────────────────────────────────────────────────────
 class AnalyzeRequest(BaseModel):
     lat: float
     lng: float
@@ -134,11 +51,11 @@ class EdgeDetectRequest(BaseModel):
     source: Optional[str] = "auto"
     canny_low: Optional[int] = 50
     canny_high: Optional[int] = 150
-    hough_threshold: Optional[int] = 80
-    min_line_px: Optional[int] = 40
+    hough_threshold: Optional[int] = 70
+    min_line_px: Optional[int] = 25
     max_line_gap: Optional[int] = 10
-    min_length_m: Optional[float] = 2.5
-    building_footprint: Optional[List[dict]] = None   # [{lat,lng}] — filtre les lignes au bâtiment
+    min_length_m: Optional[float] = 1.0
+    building_footprint: Optional[List[dict]] = None
 
 
 class RefineFootprintRequest(BaseModel):
@@ -146,26 +63,157 @@ class RefineFootprintRequest(BaseModel):
     lng: float
     label: Optional[str] = ""
     region: Optional[str] = "auto"
-    osm_footprint: List[dict]    # [{lat,lng}] — polygone OSM à affiner
+    osm_footprint: List[dict]
     zoom: Optional[int] = 21
-    image_base64: Optional[str] = None   # image satellite optionnelle (sinon backend la fetch)
+    image_base64: Optional[str] = None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# HELPER: Fetch Belgian WMS orthophoto
+# ════════════════════════════════════════════════════════════════════════
+
+async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: int, region: str = "auto") -> bytes:
+    """
+    Télécharge une orthophoto depuis les WMS belges (Wallonie ou Flandre).
+    Retourne les bytes JPEG de l'image.
+    Lève HTTPException si échec.
+    """
+    import math
+    
+    # Compute bbox
+    latM = 111320
+    lngM = 111320 * math.cos(math.radians(lat))
+    dlat = (height / 2) / latM
+    dlng = (width / 2) / lngM
+    
+    # Auto-detect region
+    if region == "auto":
+        if 50.76 < lat < 50.92 and 4.24 < lng < 4.49:
+            region = "brussels"
+        elif lat > 50.78 and lng < 5.92:
+            region = "flanders"
+        else:
+            region = "wallonia"
+    
+    # Select WMS source
+    if region == "wallonia":
+        img_url = (
+            "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_2021/MapServer/WMSServer"
+            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=0&STYLES=&FORMAT=image/jpeg"
+            f"&CRS=EPSG:4326&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
+            f"&WIDTH={width}&HEIGHT={height}"
+        )
+        source = "wallonia-ign-25cm"
+    elif region == "flanders":
+        img_url = (
+            "https://geo.api.vlaanderen.be/OMWRGBMRVL/wms"
+            f"?service=WMS&version=1.3.0&request=GetMap&layers=omwrgbmrvl"
+            f"&styles=&format=image/jpeg&CRS=EPSG:4326"
+            f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}&WIDTH={width}&HEIGHT={height}"
+        )
+        source = "flanders-geopunt-25cm"
+    elif region == "brussels":
+        # Brussels: pas de WMS fiable trouvé → fallback sur Wallonie (couvre aussi BXL en périphérie)
+        img_url = (
+            "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_2021/MapServer/WMSServer"
+            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=0&STYLES=&FORMAT=image/jpeg"
+            f"&CRS=EPSG:4326&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
+            f"&WIDTH={width}&HEIGHT={height}"
+        )
+        source = "wallonia-fallback-for-brussels"
+    else:
+        raise HTTPException(status_code=400, detail=f"Région '{region}' non supportée")
+    
+    # Download
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            r = await client.get(img_url)
+            r.raise_for_status()
+            img_bytes = r.content
+            if len(img_bytes) < 1000:
+                raise HTTPException(status_code=502, detail=f"WMS {source} image invalide")
+            return img_bytes
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"WMS {source} HTTP {e.response.status_code} — service indisponible"
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"WMS {source} erreur : {str(e)[:100]}")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ════════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+async def healthcheck():
+    return {
+        "service": "WeCover API",
+        "version": "0.5.0",
+        "status": "running",
+        "endpoints": ["/api/cadastre", "/api/analyze", "/api/detect-edges", "/api/refine-footprint"],
+    }
+
+
+@app.get("/api/cadastre")
+async def get_cadastre(lat: float, lng: float):
+    """OSM Overpass query for building footprints in Belgium."""
+    radius_m = 80
+    query = f"""
+    [out:json][timeout:15];
+    (
+      way["building"](around:{radius_m},{lat},{lng});
+      relation["building"](around:{radius_m},{lat},{lng});
+    );
+    out geom;
+    """
+    
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            r = await client.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+            )
+            r.raise_for_status()
+            data = r.json()
+            
+            buildings = []
+            for elem in data.get("elements", []):
+                if elem["type"] == "way" and "geometry" in elem:
+                    coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in elem["geometry"]]
+                    buildings.append({"id": elem["id"], "coords": coords})
+                elif elem["type"] == "relation" and "members" in elem:
+                    for member in elem["members"]:
+                        if member["role"] == "outer" and "geometry" in member:
+                            coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in member["geometry"]]
+                            buildings.append({"id": f"{elem['id']}-{member.get('ref', 0)}", "coords": coords})
+            
+            return {"buildings": buildings, "count": len(buildings)}
+        
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"OSM Overpass error: {str(e)[:150]}")
 
 
 @app.post("/api/analyze")
 async def analyze_roof(req: AnalyzeRequest):
+    """
+    Claude roof analysis with Belgian WMS imagery fallback.
+    If frontend doesn't provide image_base64, backend fetches from WMS.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-
-    solar_ctx = "Pas de données Solar API."
+    
+    # Solar API context
+    solar_ctx = ""
     if req.solar_segments:
-        lines = [
-            f"  Pan {i+1}: pente={s.get('pitch',0):.0f}°, azimut={s.get('azimuth',0):.0f}°, surface={s.get('area',0):.0f}m²"
-            for i, s in enumerate(req.solar_segments)
-        ]
-        solar_ctx = "Solar API (pentes/azimuts fiables) :\n" + "\n".join(lines)
-
-    cadastre_ctx = "Pas de cadastre disponible — devine l'emprise du bâtiment principal."
+        segs = [f"Pan {i+1}: {s.get('area_m2',0):.1f}m², pente {s.get('pitch',0):.0f}°, az {s.get('azimuth',0):.0f}°"
+                for i, s in enumerate(req.solar_segments[:10])]
+        solar_ctx = f"SOLAR API GOOGLE ({len(req.solar_segments)} pans) :\n" + "\n".join(segs)
+    
+    # Cadastre context
+    cadastre_ctx = ""
     if req.building_footprint:
         coords = ", ".join(f"({p['lat']:.6f},{p['lng']:.6f})" for p in req.building_footprint[:10])
         suffix = " ..." if len(req.building_footprint) > 10 else ""
@@ -174,28 +222,21 @@ async def analyze_roof(req: AnalyzeRequest):
             f"{coords}{suffix}\n"
             f"→ Tous les pans DOIVENT être dans cette emprise. Couvre toute l'emprise."
         )
-
-    # Si le frontend n'a pas pu capturer l'image (CORS/referrer), on tente côté backend
+    
+    # Fetch image if not provided
     if not req.image_base64:
-        gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
-        if gkey:
-            import base64
-            img_url = (
-                f"https://maps.googleapis.com/maps/api/staticmap?"
-                f"center={req.lat},{req.lng}&zoom={req.zoom}&size={req.image_width}x{req.image_height}"
-                f"&scale=2&maptype=satellite&key={gkey}"
+        try:
+            img_bytes = await fetch_belgian_orthophoto(
+                req.lat, req.lng, req.image_width, req.image_height, req.region
             )
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    r = await client.get(img_url)
-                    r.raise_for_status()
-                    req.image_base64 = base64.b64encode(r.content).decode("ascii")
-            except Exception as e:
-                # On laisse req.image_base64 à None → fallback mode GPS-only
-                pass
-
+            import base64
+            req.image_base64 = base64.b64encode(img_bytes).decode("ascii")
+        except HTTPException:
+            # WMS failed → GPS-only mode
+            pass
+    
     has_image = bool(req.image_base64)
-
+    
     if has_image:
         import math
         px_per_m = (256 * (2 ** req.zoom)) * math.cos(math.radians(req.lat)) / 40075016
@@ -247,28 +288,34 @@ Pour chaque pan :
 
 JSON UNIQUEMENT :
 {{"planes":[{{"name":"Pan Sud","offsets_m":[[-4,-3],[4,-3],[4,3],[-4,3]],"pitch_deg":35,"azimuth_deg":180}}],"building_eave_height_m":6.0,"building_type":"...","notes":""}}"""
-
+    
     content = []
     if has_image:
         content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": req.image_base64}})
     content.append({"type": "text", "text": prompt})
-
+    
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2500,
+            max_tokens=3000,
             messages=[{"role": "user", "content": content}],
         )
         text = message.content[0].text if message.content else ""
-        import re, json
+        
+        import json, re
         m = re.search(r"\{[\s\S]*\}", text)
         if not m:
-            raise HTTPException(status_code=502, detail=f"AI returned non-JSON: {text[:200]}")
+            raise HTTPException(status_code=502, detail=f"AI non-JSON: {text[:200]}")
         result = json.loads(m.group(0))
-        result["_coord_mode"] = "pixels" if has_image else "meters"
-        result["_image_used"] = has_image
-        return result
+        
+        return {
+            "result": result,
+            "raw": text,
+            "has_image": has_image,
+            "source": "belgian-wms" if (has_image and not req.image_base64) else "frontend",
+        }
+    
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
     except Exception as e:
@@ -278,136 +325,56 @@ JSON UNIQUEMENT :
 @app.post("/api/detect-edges")
 async def detect_edges(req: EdgeDetectRequest):
     """
-    Détection d'arêtes de toiture via OpenCV Canny + Hough.
-    Sources : orthophoto IGN Wallonie / Geopunt Flandre / Google Static Maps fallback.
-    Filtre les panneaux solaires (lignes en grille régulière) mais GARDE les lucarnes et chiens-assis.
+    Détection d'arêtes OpenCV Canny + Hough sur orthophoto WMS belge.
+    Filtre par building_footprint si fourni.
     """
     import io, math
     from PIL import Image
     import numpy as np
     import cv2
-
+    
     lat, lng = req.lat, req.lng
     zoom = req.zoom or 21
     W, H = 1024, 1024
-
-    # Bbox de l'image en degrés (approximation locale Belgique)
+    
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
     dlat = (H / 2) / latM
     dlng = (W / 2) / lngM
-
-    # ── Sélection source imagery ──────────────────────────────────────
-    # Auto-détection région par bounds approximatives
-    region = req.source
-    if region == "auto":
-        # Bruxelles : lat 50.76-50.92, lng 4.24-4.49
-        if 50.76 < lat < 50.92 and 4.24 < lng < 4.49:
-            region = "brussels"
-        # Flandre : nord de 50.78, ouest de 5.92
-        elif lat > 50.78 and lng < 5.92:
-            region = "flanders"
-        else:
-            region = "wallonia"
-
-    img_url = None
-    source_used = None
-    if region == "wallonia":
-        img_url = (
-            "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_2021/MapServer/WMSServer"
-            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=0&STYLES=&FORMAT=image/jpeg"
-            f"&CRS=EPSG:4326&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
-            f"&WIDTH={W}&HEIGHT={H}"
-        )
-        source_used = "wallonia-ign-25cm"
-    elif region == "flanders":
-        img_url = (
-            "https://geo.api.vlaanderen.be/OMWRGBMRVL/wms"
-            f"?service=WMS&version=1.3.0&request=GetMap&layers=omwrgbmrvl"
-            f"&styles=&format=image/jpeg&CRS=EPSG:4326"
-            f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}&WIDTH={W}&HEIGHT={H}"
-        )
-        source_used = "flanders-geopunt-25cm"
-    elif region == "brussels":
-        # Urbis Brussels Orthophoto WMS (10cm, gratuit, pas de restriction DMA)
-        img_url = (
-            "https://geoservices.irisnet.be/geoserver/ows"
-            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=urbisFR%3AorthoB"
-            f"&STYLES=&FORMAT=image/jpeg&CRS=EPSG:4326"
-            f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}&WIDTH={W}&HEIGHT={H}"
-        )
-        source_used = "brussels-urbis-10cm"
-
-    # Fallback : si région non reconnue ou WMS échoue, on lève une erreur claire
-    if not img_url:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Région '{region}' non supportée — coordonnées hors Belgique ?"
-        )
-
-    # ── Téléchargement WMS ─────────────────────────────────────────────
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            r = await client.get(img_url)
-            r.raise_for_status()
-            img_bytes = r.content
-            if len(img_bytes) < 1000:  # Image trop petite = erreur WMS probable
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"WMS {source_used} retourne une image invalide ({len(img_bytes)} bytes)"
-                )
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"WMS {source_used} erreur HTTP {e.response.status_code} — service temporairement indisponible ?"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"WMS {source_used} échec téléchargement : {str(e)[:150]}"
-            )
-
-    # ── Décodage et prétraitement ─────────────────────────────────────
-    try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("L")
-        np_img = np.array(img)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image decode failed: {e}")
-
-    # CLAHE pour rehausser le contraste local
+    
+    # Fetch image
+    img_bytes = await fetch_belgian_orthophoto(lat, lng, W, H, req.source)
+    
+    # Decode
+    img = Image.open(io.BytesIO(img_bytes)).convert("L")
+    np_img = np.array(img)
+    
+    # CLAHE + blur
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     np_img = clahe.apply(np_img)
-
-    # Flou gaussien anti-bruit
     blurred = cv2.GaussianBlur(np_img, (5, 5), 1.0)
-
+    
     # Canny
-    canny_low = req.canny_low or 50
-    canny_high = req.canny_high or 150
-    edges = cv2.Canny(blurred, canny_low, canny_high, apertureSize=3)
-
-    # Hough probabiliste
-    hough_thresh = req.hough_threshold or 70
-    min_line_px = req.min_line_px or 25      # ~5-6m à zoom 21 en Belgique
-    max_gap_px = req.max_line_gap or 10
-
+    edges = cv2.Canny(blurred, req.canny_low or 50, req.canny_high or 150, apertureSize=3)
+    
+    # Hough
     lines = cv2.HoughLinesP(
         edges, rho=1, theta=np.pi / 180,
-        threshold=hough_thresh,
-        minLineLength=min_line_px,
-        maxLineGap=max_gap_px,
+        threshold=req.hough_threshold or 70,
+        minLineLength=req.min_line_px or 25,
+        maxLineGap=req.max_line_gap or 10,
     )
-
+    
     if lines is None:
-        return {"lines": [], "panels": [], "count": 0, "source": source_used, "image_size": [W, H]}
-
-    # ── Conversion pixels → lat/lng ───────────────────────────────────
+        return {"lines": [], "panels": [], "count": 0, "source": req.source}
+    
+    # Convert to lat/lng
     def px_to_ll(px, py):
         latv = lat + dlat - (py / H) * 2 * dlat
         lngv = lng - dlng + (px / W) * 2 * dlng
         return latv, lngv
-
-    min_length_m = req.min_length_m or 1.0   # ↓ Garde lucarnes/chiens-assis (>1m)
+    
+    min_length_m = req.min_length_m or 1.0
     raw_lines = []
     for line in lines:
         x1, y1, x2, y2 = [int(v) for v in line[0]]
@@ -419,7 +386,6 @@ async def detect_edges(req: EdgeDetectRequest):
         if length_m < min_length_m:
             continue
         angle = (math.degrees(math.atan2(dy, dx)) + 180) % 180
-        # Centre en mètres pour clustering
         cx = ((lng1 + lng2) / 2) * lngM
         cy = ((lat1 + lat2) / 2) * latM
         raw_lines.append({
@@ -429,63 +395,48 @@ async def detect_edges(req: EdgeDetectRequest):
             "angle_deg": round(angle, 1),
             "_cx": cx, "_cy": cy,
         })
-
-    # ── Filtre panneaux solaires : grille parallèle régulière ─────────
-    # Heuristique : un panneau solaire = ligne courte (<2.5m) ayant 3+ voisins
-    # parallèles (±8°) à moins de 2.5m. Les lucarnes/chiens-assis sont isolés.
+    
+    # Panel detection (solar panels = short parallel lines)
     panel_indices = set()
-    PANEL_MAX_LEN = 2.5
-    PARALLEL_TOL_DEG = 8
-    NEIGHBOR_RADIUS_M = 2.5
-    MIN_NEIGHBORS = 3
-
     for i, li in enumerate(raw_lines):
-        if li["length_m"] > PANEL_MAX_LEN:
+        if li["length_m"] > 2.5:
             continue
         cnt = 0
         for j, lj in enumerate(raw_lines):
-            if i == j or lj["length_m"] > PANEL_MAX_LEN:
+            if i == j or lj["length_m"] > 2.5:
                 continue
             adiff = abs(li["angle_deg"] - lj["angle_deg"])
             adiff = min(adiff, 180 - adiff)
-            if adiff > PARALLEL_TOL_DEG:
+            if adiff > 8:
                 continue
             ddx = li["_cx"] - lj["_cx"]
             ddy = li["_cy"] - lj["_cy"]
-            if math.sqrt(ddx * ddx + ddy * ddy) > NEIGHBOR_RADIUS_M:
+            if math.sqrt(ddx * ddx + ddy * ddy) > 2.5:
                 continue
             cnt += 1
-        if cnt >= MIN_NEIGHBORS:
+        if cnt >= 3:
             panel_indices.add(i)
-
-    # ── Filtre par proximité au bâtiment cadastral (si fourni) ────────
-    # On garde uniquement les lignes dont au moins UNE extrémité est à
-    # moins de FOOTPRINT_MARGIN_M du polygone cadastral.
+    
+    # Footprint filter
     FOOTPRINT_MARGIN_M = 5.0
     far_indices = set()
     if req.building_footprint and len(req.building_footprint) >= 3:
-        # Convertir le footprint en mètres relatifs au centre
-        fp_m = [
-            ((p["lng"] - lng) * lngM, (p["lat"] - lat) * latM)
-            for p in req.building_footprint
-        ]
-
+        fp_m = [((p["lng"] - lng) * lngM, (p["lat"] - lat) * latM) for p in req.building_footprint]
+        
         def dist_point_to_polygon_m(px_m, py_m):
-            """Distance min d'un point au polygone (mètres). 0 si à l'intérieur."""
-            # Point-in-polygon (ray casting)
+            # Point-in-polygon
             inside = False
             n = len(fp_m)
             j = n - 1
             for k in range(n):
                 xi, yi = fp_m[k]
                 xj, yj = fp_m[j]
-                if ((yi > py_m) != (yj > py_m)) and \
-                   (px_m < (xj - xi) * (py_m - yi) / (yj - yi + 1e-12) + xi):
+                if ((yi > py_m) != (yj > py_m)) and (px_m < (xj - xi) * (py_m - yi) / (yj - yi + 1e-12) + xi):
                     inside = not inside
                 j = k
             if inside:
                 return 0.0
-            # Distance min aux segments
+            # Distance to edges
             min_d = float("inf")
             for k in range(n):
                 ax, ay = fp_m[k]
@@ -502,102 +453,70 @@ async def detect_edges(req: EdgeDetectRequest):
                 if d < min_d:
                     min_d = d
             return min_d
-
+        
         for i, li in enumerate(raw_lines):
-            cx_m = li["_cx"]
-            cy_m = li["_cy"]
-            # Convertir extrémités en mètres relatifs au centre
             p1x = (li["lng1"] - lng) * lngM
             p1y = (li["lat1"] - lat) * latM
             p2x = (li["lng2"] - lng) * lngM
             p2y = (li["lat2"] - lat) * latM
-            # Au moins une extrémité ou le centre doit être proche
+            cx_m = li["_cx"]
+            cy_m = li["_cy"]
             d1 = dist_point_to_polygon_m(p1x, p1y)
             d2 = dist_point_to_polygon_m(p2x, p2y)
             dc = dist_point_to_polygon_m(cx_m, cy_m)
             if min(d1, d2, dc) > FOOTPRINT_MARGIN_M:
                 far_indices.add(i)
-
-    # Séparer résultats
+    
+    # Separate results
     keep_lines, panel_lines = [], []
-    excluded_count = len(far_indices)
     for i, li in enumerate(raw_lines):
         if i in far_indices:
-            continue  # trop loin du bâtiment
+            continue
         out = {k: v for k, v in li.items() if not k.startswith("_")}
         if i in panel_indices:
             panel_lines.append(out)
         else:
             keep_lines.append(out)
-
+    
     keep_lines.sort(key=lambda x: -x["length_m"])
     panel_lines.sort(key=lambda x: -x["length_m"])
-
+    
     return {
         "lines": keep_lines,
         "panels": panel_lines,
         "count": len(keep_lines),
         "panel_count": len(panel_lines),
+        "filtered_far_count": len(far_indices),
         "raw_count": len(raw_lines),
-        "filtered_far_count": excluded_count,
-        "source": source_used,
-        "image_size": [W, H],
-        "filters": {
-            "min_length_m": min_length_m,
-            "canny": [canny_low, canny_high],
-            "footprint_margin_m": FOOTPRINT_MARGIN_M if req.building_footprint else None,
-            "panel_detection": {
-                "max_length_m": PANEL_MAX_LEN,
-                "parallel_tol_deg": PARALLEL_TOL_DEG,
-                "neighbor_radius_m": NEIGHBOR_RADIUS_M,
-                "min_neighbors": MIN_NEIGHBORS,
-            },
-        },
+        "source": req.source,
     }
 
 
-# ────────────────────────────────────────────────────────────
-# /api/refine-footprint — Claude affine le polygone cadastral OSM
-# ────────────────────────────────────────────────────────────
 @app.post("/api/refine-footprint")
 async def refine_footprint(req: RefineFootprintRequest):
     """
-    Prend le polygone OSM cadastral (70-80% précis) + image satellite,
-    demande à Claude de raffiner le contour pour qu'il colle EXACTEMENT
-    à la toiture visible.
+    Claude affine le polygone cadastral OSM pour qu'il colle exactement à la toiture.
+    Utilise Belgian WMS orthophoto.
     """
-    import io, math, json, re
+    import base64, json, re, math
+    
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-
+    
     if not req.osm_footprint or len(req.osm_footprint) < 3:
         raise HTTPException(status_code=400, detail="osm_footprint requis (>= 3 sommets)")
-
+    
     lat, lng = req.lat, req.lng
-    zoom = req.zoom or 21
-    W, H = 640, 640
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-
-    # Capture image si pas fournie
-    img_b64 = req.image_base64
-    if not img_b64:
-        gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
-        if not gkey:
-            raise HTTPException(status_code=400, detail="image_base64 ou GOOGLE_MAPS_API_KEY requis")
-        img_url = (
-            f"https://maps.googleapis.com/maps/api/staticmap?"
-            f"center={lat},{lng}&zoom={zoom}&size={W}x{H}&scale=2"
-            f"&maptype=satellite&key={gkey}"
-        )
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(img_url)
-            r.raise_for_status()
-            import base64
-            img_b64 = base64.b64encode(r.content).decode("ascii")
-
-    # Convertir le footprint en offsets mètres pour Claude
+    
+    # Fetch image if not provided
+    if not req.image_base64:
+        img_bytes = await fetch_belgian_orthophoto(lat, lng, 640, 640, req.region)
+        req.image_base64 = base64.b64encode(img_bytes).decode("ascii")
+    
+    # Convert footprint to meters
     fp_meters = [
         {
             "east_m": round((p["lng"] - lng) * lngM, 2),
@@ -605,11 +524,11 @@ async def refine_footprint(req: RefineFootprintRequest):
         }
         for p in req.osm_footprint
     ]
-
+    
     prompt = f"""Tu affines un polygone cadastral OSM pour qu'il colle EXACTEMENT à la toiture visible sur l'image satellite.
 
 ADRESSE : {req.label or f"{lat},{lng}"}
-IMAGE : {W}×{H}px centrée sur ({lat:.6f}, {lng:.6f})
+IMAGE : 640×640px centrée sur ({lat:.6f}, {lng:.6f})
 
 POLYGONE OSM ACTUEL (à affiner — {len(fp_meters)} sommets, ~70-80% précis) :
 {json.dumps(fp_meters, indent=2)}
@@ -633,12 +552,12 @@ Réponds UNIQUEMENT en JSON valide :
   "confidence": 0.85,
   "notes": "Ajustement de 4 sommets sur la façade rue, ajout d'un décrochement arrière"
 }}"""
-
+    
     content = [
-        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": req.image_base64}},
         {"type": "text", "text": prompt},
     ]
-
+    
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
@@ -651,15 +570,15 @@ Réponds UNIQUEMENT en JSON valide :
         if not m:
             raise HTTPException(status_code=502, detail=f"AI non-JSON: {text[:200]}")
         result = json.loads(m.group(0))
-
-        # Convertir refined_footprint en lat/lng pour le frontend
+        
+        # Convert to lat/lng
         refined_ll = []
         for p in result.get("refined_footprint", []):
             refined_ll.append({
                 "lat": lat + p["north_m"] / latM,
                 "lng": lng + p["east_m"] / lngM,
             })
-
+        
         return {
             "refined_footprint": refined_ll,
             "refined_count": len(refined_ll),
@@ -667,13 +586,8 @@ Réponds UNIQUEMENT en JSON valide :
             "confidence": result.get("confidence"),
             "notes": result.get("notes", ""),
         }
-
+    
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/roof-solver")
-async def roof_solver():
-    return {"status": "not_implemented_yet", "phase": 4}
