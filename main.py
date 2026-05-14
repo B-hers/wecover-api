@@ -328,46 +328,44 @@ async def detect_edges(req: EdgeDetectRequest):
             f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}&WIDTH={W}&HEIGHT={H}"
         )
         source_used = "flanders-geopunt-25cm"
-
-    # Fallback Google Static Maps (Bruxelles ou échec WMS)
-    if not img_url or region == "brussels":
-        gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
-        if not gkey:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Région {region} : pas d'orthophoto WMS et GOOGLE_MAPS_API_KEY non configuré"
-            )
+    elif region == "brussels":
+        # Urbis Brussels Orthophoto WMS (10cm, gratuit, pas de restriction DMA)
         img_url = (
-            f"https://maps.googleapis.com/maps/api/staticmap?"
-            f"center={lat},{lng}&zoom={zoom}&size={W//2}x{H//2}&scale=2"
-            f"&maptype=satellite&key={gkey}"
+            "https://geoservices.irisnet.be/geoserver/ows"
+            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=urbisFR%3AorthoB"
+            f"&STYLES=&FORMAT=image/jpeg&CRS=EPSG:4326"
+            f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}&WIDTH={W}&HEIGHT={H}"
         )
-        source_used = source_used or "google-satellite"
+        source_used = "brussels-urbis-10cm"
 
-    # ── Téléchargement avec fallback Google si WMS échoue ─────────────
+    # Fallback : si région non reconnue ou WMS échoue, on lève une erreur claire
+    if not img_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Région '{region}' non supportée — coordonnées hors Belgique ?"
+        )
+
+    # ── Téléchargement WMS ─────────────────────────────────────────────
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             r = await client.get(img_url)
             r.raise_for_status()
             img_bytes = r.content
-        except Exception as e:
-            # Fallback automatique sur Google si WMS national échoue
-            gkey = os.environ.get("GOOGLE_MAPS_API_KEY", "")
-            if gkey and "google" not in source_used:
-                fallback_url = (
-                    f"https://maps.googleapis.com/maps/api/staticmap?"
-                    f"center={lat},{lng}&zoom={zoom}&size={W//2}x{H//2}&scale=2"
-                    f"&maptype=satellite&key={gkey}"
+            if len(img_bytes) < 1000:  # Image trop petite = erreur WMS probable
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"WMS {source_used} retourne une image invalide ({len(img_bytes)} bytes)"
                 )
-                try:
-                    r = await client.get(fallback_url)
-                    r.raise_for_status()
-                    img_bytes = r.content
-                    source_used = source_used + "+fallback-google"
-                except Exception as e2:
-                    raise HTTPException(status_code=502, detail=f"Image fetch failed (WMS + Google): {e2}")
-            else:
-                raise HTTPException(status_code=502, detail=f"Image fetch failed: {e}")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"WMS {source_used} erreur HTTP {e.response.status_code} — service temporairement indisponible ?"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"WMS {source_used} échec téléchargement : {str(e)[:150]}"
+            )
 
     # ── Décodage et prétraitement ─────────────────────────────────────
     try:
