@@ -80,11 +80,13 @@ async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: i
     """
     import math
     
-    # Compute bbox
+    # Compute bbox - target 50m coverage for better resolution (~0.08m/px at 640px)
+    # instead of previous 640m coverage (~1m/px)
+    target_width_m = 50  # meters of real-world coverage
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-    dlat = (height / 2) / latM
-    dlng = (width / 2) / lngM
+    dlat = (target_width_m / 2) / latM
+    dlng = (target_width_m / 2) / lngM
     
     # Auto-detect region
     if region == "auto":
@@ -178,18 +180,35 @@ async def get_cadastre(lat: float, lng: float):
             r.raise_for_status()
             data = r.json()
             
-            buildings = []
+            # Convert OSM to GeoJSON format expected by frontend
+            features = []
             for elem in data.get("elements", []):
                 if elem["type"] == "way" and "geometry" in elem:
-                    coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in elem["geometry"]]
-                    buildings.append({"id": elem["id"], "coords": coords})
+                    coords = [[pt["lon"], pt["lat"]] for pt in elem["geometry"]]
+                    features.append({
+                        "type": "Feature",
+                        "id": elem["id"],
+                        "geometry": {"type": "Polygon", "coordinates": [coords]},
+                        "properties": {}
+                    })
                 elif elem["type"] == "relation" and "members" in elem:
                     for member in elem["members"]:
                         if member["role"] == "outer" and "geometry" in member:
-                            coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in member["geometry"]]
-                            buildings.append({"id": f"{elem['id']}-{member.get('ref', 0)}", "coords": coords})
+                            coords = [[pt["lon"], pt["lat"]] for pt in member["geometry"]]
+                            features.append({
+                                "type": "Feature",
+                                "id": f"{elem['id']}-{member.get('ref', 0)}",
+                                "geometry": {"type": "Polygon", "coordinates": [coords]},
+                                "properties": {}
+                            })
             
-            return {"buildings": buildings, "count": len(buildings)}
+            return {
+                "type": "FeatureCollection",
+                "data": {
+                    "type": "FeatureCollection",
+                    "features": features
+                }
+            }
         
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"OSM Overpass error: {str(e)[:150]}")
@@ -297,7 +316,7 @@ JSON UNIQUEMENT :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-4-20250514",
             max_tokens=3000,
             messages=[{"role": "user", "content": content}],
         )
@@ -309,12 +328,12 @@ JSON UNIQUEMENT :
             raise HTTPException(status_code=502, detail=f"AI non-JSON: {text[:200]}")
         result = json.loads(m.group(0))
         
-        return {
-            "result": result,
-            "raw": text,
-            "has_image": has_image,
-            "source": "belgian-wms" if (has_image and not req.image_base64) else "frontend",
-        }
+        # Add coordinate mode flag for frontend
+        result["_coord_mode"] = "pixels" if has_image else "meters"
+        result["_has_image"] = has_image
+        result["_source"] = "belgian-wms" if (has_image and not req.image_base64) else ("frontend" if has_image else "gps-only")
+        
+        return result
     
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
@@ -561,7 +580,7 @@ Réponds UNIQUEMENT en JSON valide :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-4-20250514",
             max_tokens=2000,
             messages=[{"role": "user", "content": content}],
         )
