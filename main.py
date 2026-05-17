@@ -72,7 +72,17 @@ class RefineFootprintRequest(BaseModel):
 # HELPER: Fetch Belgian WMS orthophoto
 # ════════════════════════════════════════════════════════════════════════
 
-async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: int, region: str = "auto") -> bytes:
+ORTHO_COVERAGE_M = 50
+
+
+async def fetch_belgian_orthophoto(
+    lat: float,
+    lng: float,
+    width: int,
+    height: int,
+    region: str = "auto",
+    coverage_m: float = ORTHO_COVERAGE_M,
+) -> bytes:
     """
     Télécharge une orthophoto depuis les WMS belges (Wallonie ou Flandre).
     Retourne les bytes JPEG de l'image.
@@ -80,13 +90,12 @@ async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: i
     """
     import math
     
-    # Compute bbox - target 50m coverage for better resolution (~0.08m/px at 640px)
-    # instead of previous 640m coverage (~1m/px)
-    target_width_m = 50  # meters of real-world coverage
+    # Compute bbox from the same real-world coverage used later to convert pixels.
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-    dlat = (target_width_m / 2) / latM
-    dlng = (target_width_m / 2) / lngM
+    coverage_h_m = coverage_m * (height / width)
+    dlat = (coverage_h_m / 2) / latM
+    dlng = (coverage_m / 2) / lngM
     
     # Auto-detect region
     if region == "auto":
@@ -115,33 +124,24 @@ async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: i
         )
         source = "flanders-geopunt-25cm"
     elif region == "brussels":
-        # UrbIS Brussels Orthophoto WMS (officiel Bruxelles Mobilité)
-        # Source: https://data.mobility.brussels/info/Ortho
         img_url = (
             "https://geoservices-urbis.irisnet.be/geoserver/urbisgrid/ows"
-            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=urbisgrid:ortho2021"
-            f"&STYLES=&FORMAT=image/jpeg&CRS=EPSG:4326"
-            f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
+            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=urbisgrid:Ortho&STYLES=&FORMAT=image/jpeg"
+            f"&CRS=EPSG:4326&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
             f"&WIDTH={width}&HEIGHT={height}"
         )
-        source = "brussels-urbis-ortho2021"
+        source = "brussels-urbis-ortho"
     else:
         raise HTTPException(status_code=400, detail=f"Région '{region}' non supportée")
     
     # Download
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WeCoverMesures/0.5"}) as client:
         try:
             r = await client.get(img_url)
             r.raise_for_status()
             img_bytes = r.content
             if len(img_bytes) < 1000:
-                raise HTTPException(status_code=502, detail=f"WMS {source} image invalide (trop petite)")
-            
-            # Quick check: if image is all white/blank (common WMS error), reject it
-            # Sample first 100 bytes - if all are 0xFF (white JPEG), it's likely blank
-            if img_bytes[:100].count(0xFF) > 95:
-                raise HTTPException(status_code=502, detail=f"WMS {source} image blanche (hors couverture)")
-            
+                raise HTTPException(status_code=502, detail=f"WMS {source} image invalide")
             return img_bytes
         except httpx.HTTPStatusError as e:
             raise HTTPException(
@@ -167,7 +167,7 @@ async def healthcheck():
 
 
 @app.get("/api/cadastre")
-async def get_cadastre(lat: float, lng: float):
+async def get_cadastre(lat: float, lng: float, region: str = "auto"):
     """OSM Overpass query for building footprints in Belgium."""
     radius_m = 80
     query = f"""
@@ -179,16 +179,30 @@ async def get_cadastre(lat: float, lng: float):
     out geom;
     """
     
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    overpass_urls = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
+    headers = {
+        "User-Agent": "WeCoverMesures/0.5 (building-footprint lookup)",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+        last_error = None
+        data = None
+        for url in overpass_urls:
+            try:
+                r = await client.post(url, data={"data": query})
+                r.raise_for_status()
+                data = r.json()
+                break
+            except Exception as e:
+                last_error = e
+        if data is None:
+            raise HTTPException(status_code=502, detail=f"OSM Overpass error: {str(last_error)[:150]}")
+
         try:
-            r = await client.post(
-                "https://overpass-api.de/api/interpreter",
-                data={"data": query},
-                headers={"User-Agent": "WeCoverAPI/0.5.0 (roof measurement tool)"},
-            )
-            r.raise_for_status()
-            data = r.json()
-            
             # Convert OSM to GeoJSON format expected by frontend
             features = []
             for elem in data.get("elements", []):
@@ -236,7 +250,7 @@ async def analyze_roof(req: AnalyzeRequest):
     # Solar API context
     solar_ctx = ""
     if req.solar_segments:
-        segs = [f"Pan {i+1}: {s.get('area_m2',0):.1f}m², pente {s.get('pitch',0):.0f}°, az {s.get('azimuth',0):.0f}°"
+        segs = [f"Pan {i+1}: {s.get('area_m2', s.get('area', 0)):.1f}m², pente {s.get('pitch',0):.0f}°, az {s.get('azimuth',0):.0f}°"
                 for i, s in enumerate(req.solar_segments[:10])]
         solar_ctx = f"SOLAR API GOOGLE ({len(req.solar_segments)} pans) :\n" + "\n".join(segs)
     
@@ -252,6 +266,7 @@ async def analyze_roof(req: AnalyzeRequest):
         )
     
     # Fetch image if not provided
+    image_from_backend = False
     if not req.image_base64:
         try:
             img_bytes = await fetch_belgian_orthophoto(
@@ -259,6 +274,7 @@ async def analyze_roof(req: AnalyzeRequest):
             )
             import base64
             req.image_base64 = base64.b64encode(img_bytes).decode("ascii")
+            image_from_backend = True
         except HTTPException:
             # WMS failed → GPS-only mode
             pass
@@ -340,7 +356,7 @@ JSON UNIQUEMENT :
         # Add coordinate mode flag for frontend
         result["_coord_mode"] = "pixels" if has_image else "meters"
         result["_has_image"] = has_image
-        result["_source"] = "belgian-wms" if (has_image and not req.image_base64) else ("frontend" if has_image else "gps-only")
+        result["_source"] = "belgian-wms" if image_from_backend else ("frontend" if has_image else "gps-only")
         
         return result
     
@@ -362,19 +378,17 @@ async def detect_edges(req: EdgeDetectRequest):
     import cv2
     
     lat, lng = req.lat, req.lng
-    zoom = req.zoom or 21
     W, H = 1024, 1024
     
-    # CRITICAL: Image covers 50m real-world (set in fetch_belgian_orthophoto)
-    # NOT 1024m as previously calculated
-    target_width_m = 50
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-    dlat = (target_width_m / 2) / latM
-    dlng = (target_width_m / 2) / lngM
+    coverage_m = ORTHO_COVERAGE_M
+    coverage_h_m = coverage_m * (H / W)
+    dlat = (coverage_h_m / 2) / latM
+    dlng = (coverage_m / 2) / lngM
     
     # Fetch image
-    img_bytes = await fetch_belgian_orthophoto(lat, lng, W, H, req.source)
+    img_bytes = await fetch_belgian_orthophoto(lat, lng, W, H, req.source, coverage_m=coverage_m)
     
     # Decode
     img = Image.open(io.BytesIO(img_bytes)).convert("L")
