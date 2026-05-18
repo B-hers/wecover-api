@@ -72,17 +72,7 @@ class RefineFootprintRequest(BaseModel):
 # HELPER: Fetch Belgian WMS orthophoto
 # ════════════════════════════════════════════════════════════════════════
 
-ORTHO_COVERAGE_M = 50
-
-
-async def fetch_belgian_orthophoto(
-    lat: float,
-    lng: float,
-    width: int,
-    height: int,
-    region: str = "auto",
-    coverage_m: float = ORTHO_COVERAGE_M,
-) -> bytes:
+async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: int, region: str = "auto") -> bytes:
     """
     Télécharge une orthophoto depuis les WMS belges (Wallonie ou Flandre).
     Retourne les bytes JPEG de l'image.
@@ -90,12 +80,11 @@ async def fetch_belgian_orthophoto(
     """
     import math
     
-    # Compute bbox from the same real-world coverage used later to convert pixels.
+    # Compute bbox
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-    coverage_h_m = coverage_m * (height / width)
-    dlat = (coverage_h_m / 2) / latM
-    dlng = (coverage_m / 2) / lngM
+    dlat = (height / 2) / latM
+    dlng = (width / 2) / lngM
     
     # Auto-detect region
     if region == "auto":
@@ -124,18 +113,19 @@ async def fetch_belgian_orthophoto(
         )
         source = "flanders-geopunt-25cm"
     elif region == "brussels":
+        # Brussels: pas de WMS fiable trouvé → fallback sur Wallonie (couvre aussi BXL en périphérie)
         img_url = (
-            "https://geoservices-urbis.irisnet.be/geoserver/urbisgrid/ows"
-            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=urbisgrid:Ortho&STYLES=&FORMAT=image/jpeg"
+            "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_2021/MapServer/WMSServer"
+            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=0&STYLES=&FORMAT=image/jpeg"
             f"&CRS=EPSG:4326&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
             f"&WIDTH={width}&HEIGHT={height}"
         )
-        source = "brussels-urbis-ortho"
+        source = "wallonia-fallback-for-brussels"
     else:
         raise HTTPException(status_code=400, detail=f"Région '{region}' non supportée")
     
     # Download
-    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WeCoverMesures/0.5"}) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             r = await client.get(img_url)
             r.raise_for_status()
@@ -167,7 +157,7 @@ async def healthcheck():
 
 
 @app.get("/api/cadastre")
-async def get_cadastre(lat: float, lng: float, region: str = "auto"):
+async def get_cadastre(lat: float, lng: float):
     """OSM Overpass query for building footprints in Belgium."""
     radius_m = 80
     query = f"""
@@ -179,59 +169,27 @@ async def get_cadastre(lat: float, lng: float, region: str = "auto"):
     out geom;
     """
     
-    overpass_urls = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-    ]
-    headers = {
-        "User-Agent": "WeCoverMesures/0.5 (building-footprint lookup)",
-        "Accept": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
-        last_error = None
-        data = None
-        for url in overpass_urls:
-            try:
-                r = await client.post(url, data={"data": query})
-                r.raise_for_status()
-                data = r.json()
-                break
-            except Exception as e:
-                last_error = e
-        if data is None:
-            raise HTTPException(status_code=502, detail=f"OSM Overpass error: {str(last_error)[:150]}")
-
+    async with httpx.AsyncClient(timeout=20.0) as client:
         try:
-            # Convert OSM to GeoJSON format expected by frontend
-            features = []
+            r = await client.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+            )
+            r.raise_for_status()
+            data = r.json()
+            
+            buildings = []
             for elem in data.get("elements", []):
                 if elem["type"] == "way" and "geometry" in elem:
-                    coords = [[pt["lon"], pt["lat"]] for pt in elem["geometry"]]
-                    features.append({
-                        "type": "Feature",
-                        "id": elem["id"],
-                        "geometry": {"type": "Polygon", "coordinates": [coords]},
-                        "properties": {}
-                    })
+                    coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in elem["geometry"]]
+                    buildings.append({"id": elem["id"], "coords": coords})
                 elif elem["type"] == "relation" and "members" in elem:
                     for member in elem["members"]:
                         if member["role"] == "outer" and "geometry" in member:
-                            coords = [[pt["lon"], pt["lat"]] for pt in member["geometry"]]
-                            features.append({
-                                "type": "Feature",
-                                "id": f"{elem['id']}-{member.get('ref', 0)}",
-                                "geometry": {"type": "Polygon", "coordinates": [coords]},
-                                "properties": {}
-                            })
+                            coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in member["geometry"]]
+                            buildings.append({"id": f"{elem['id']}-{member.get('ref', 0)}", "coords": coords})
             
-            return {
-                "type": "FeatureCollection",
-                "data": {
-                    "type": "FeatureCollection",
-                    "features": features
-                }
-            }
+            return {"buildings": buildings, "count": len(buildings)}
         
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"OSM Overpass error: {str(e)[:150]}")
@@ -250,7 +208,7 @@ async def analyze_roof(req: AnalyzeRequest):
     # Solar API context
     solar_ctx = ""
     if req.solar_segments:
-        segs = [f"Pan {i+1}: {s.get('area_m2', s.get('area', 0)):.1f}m², pente {s.get('pitch',0):.0f}°, az {s.get('azimuth',0):.0f}°"
+        segs = [f"Pan {i+1}: {s.get('area_m2',0):.1f}m², pente {s.get('pitch',0):.0f}°, az {s.get('azimuth',0):.0f}°"
                 for i, s in enumerate(req.solar_segments[:10])]
         solar_ctx = f"SOLAR API GOOGLE ({len(req.solar_segments)} pans) :\n" + "\n".join(segs)
     
@@ -266,7 +224,6 @@ async def analyze_roof(req: AnalyzeRequest):
         )
     
     # Fetch image if not provided
-    image_from_backend = False
     if not req.image_base64:
         try:
             img_bytes = await fetch_belgian_orthophoto(
@@ -274,7 +231,6 @@ async def analyze_roof(req: AnalyzeRequest):
             )
             import base64
             req.image_base64 = base64.b64encode(img_bytes).decode("ascii")
-            image_from_backend = True
         except HTTPException:
             # WMS failed → GPS-only mode
             pass
@@ -341,7 +297,7 @@ JSON UNIQUEMENT :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=3000,
             messages=[{"role": "user", "content": content}],
         )
@@ -353,12 +309,12 @@ JSON UNIQUEMENT :
             raise HTTPException(status_code=502, detail=f"AI non-JSON: {text[:200]}")
         result = json.loads(m.group(0))
         
-        # Add coordinate mode flag for frontend
-        result["_coord_mode"] = "pixels" if has_image else "meters"
-        result["_has_image"] = has_image
-        result["_source"] = "belgian-wms" if image_from_backend else ("frontend" if has_image else "gps-only")
-        
-        return result
+        return {
+            "result": result,
+            "raw": text,
+            "has_image": has_image,
+            "source": "belgian-wms" if (has_image and not req.image_base64) else "frontend",
+        }
     
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
@@ -378,17 +334,16 @@ async def detect_edges(req: EdgeDetectRequest):
     import cv2
     
     lat, lng = req.lat, req.lng
+    zoom = req.zoom or 21
     W, H = 1024, 1024
     
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-    coverage_m = ORTHO_COVERAGE_M
-    coverage_h_m = coverage_m * (H / W)
-    dlat = (coverage_h_m / 2) / latM
-    dlng = (coverage_m / 2) / lngM
+    dlat = (H / 2) / latM
+    dlng = (W / 2) / lngM
     
     # Fetch image
-    img_bytes = await fetch_belgian_orthophoto(lat, lng, W, H, req.source, coverage_m=coverage_m)
+    img_bytes = await fetch_belgian_orthophoto(lat, lng, W, H, req.source)
     
     # Decode
     img = Image.open(io.BytesIO(img_bytes)).convert("L")
@@ -606,7 +561,7 @@ Réponds UNIQUEMENT en JSON valide :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2000,
             messages=[{"role": "user", "content": content}],
         )
