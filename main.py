@@ -80,11 +80,13 @@ async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: i
     """
     import math
     
-    # Compute bbox
+    # Compute bbox - target 50m coverage for better resolution (~0.08m/px at 640px)
+    # instead of previous 640m coverage (~1m/px)
+    target_width_m = 50  # meters of real-world coverage
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-    dlat = (height / 2) / latM
-    dlng = (width / 2) / lngM
+    dlat = (target_width_m / 2) / latM
+    dlng = (target_width_m / 2) / lngM
     
     # Auto-detect region
     if region == "auto":
@@ -113,14 +115,16 @@ async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: i
         )
         source = "flanders-geopunt-25cm"
     elif region == "brussels":
-        # Brussels: pas de WMS fiable trouvé → fallback sur Wallonie (couvre aussi BXL en périphérie)
+        # UrbIS Brussels Orthophoto WMS (officiel Bruxelles Mobilité)
+        # Source: https://data.mobility.brussels/info/Ortho
         img_url = (
-            "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_2021/MapServer/WMSServer"
-            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=0&STYLES=&FORMAT=image/jpeg"
-            f"&CRS=EPSG:4326&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
+            "https://geoservices-urbis.irisnet.be/geoserver/urbisgrid/ows"
+            f"?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=urbisgrid:ortho2021"
+            f"&STYLES=&FORMAT=image/jpeg&CRS=EPSG:4326"
+            f"&BBOX={lat-dlat},{lng-dlng},{lat+dlat},{lng+dlng}"
             f"&WIDTH={width}&HEIGHT={height}"
         )
-        source = "wallonia-fallback-for-brussels"
+        source = "brussels-urbis-ortho2021"
     else:
         raise HTTPException(status_code=400, detail=f"Région '{region}' non supportée")
     
@@ -131,7 +135,13 @@ async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: i
             r.raise_for_status()
             img_bytes = r.content
             if len(img_bytes) < 1000:
-                raise HTTPException(status_code=502, detail=f"WMS {source} image invalide")
+                raise HTTPException(status_code=502, detail=f"WMS {source} image invalide (trop petite)")
+            
+            # Quick check: if image is all white/blank (common WMS error), reject it
+            # Sample first 100 bytes - if all are 0xFF (white JPEG), it's likely blank
+            if img_bytes[:100].count(0xFF) > 95:
+                raise HTTPException(status_code=502, detail=f"WMS {source} image blanche (hors couverture)")
+            
             return img_bytes
         except httpx.HTTPStatusError as e:
             raise HTTPException(
@@ -174,22 +184,40 @@ async def get_cadastre(lat: float, lng: float):
             r = await client.post(
                 "https://overpass-api.de/api/interpreter",
                 data={"data": query},
+                headers={"User-Agent": "WeCoverAPI/0.5.0 (roof measurement tool)"},
             )
             r.raise_for_status()
             data = r.json()
             
-            buildings = []
+            # Convert OSM to GeoJSON format expected by frontend
+            features = []
             for elem in data.get("elements", []):
                 if elem["type"] == "way" and "geometry" in elem:
-                    coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in elem["geometry"]]
-                    buildings.append({"id": elem["id"], "coords": coords})
+                    coords = [[pt["lon"], pt["lat"]] for pt in elem["geometry"]]
+                    features.append({
+                        "type": "Feature",
+                        "id": elem["id"],
+                        "geometry": {"type": "Polygon", "coordinates": [coords]},
+                        "properties": {}
+                    })
                 elif elem["type"] == "relation" and "members" in elem:
                     for member in elem["members"]:
                         if member["role"] == "outer" and "geometry" in member:
-                            coords = [{"lat": pt["lat"], "lng": pt["lon"]} for pt in member["geometry"]]
-                            buildings.append({"id": f"{elem['id']}-{member.get('ref', 0)}", "coords": coords})
+                            coords = [[pt["lon"], pt["lat"]] for pt in member["geometry"]]
+                            features.append({
+                                "type": "Feature",
+                                "id": f"{elem['id']}-{member.get('ref', 0)}",
+                                "geometry": {"type": "Polygon", "coordinates": [coords]},
+                                "properties": {}
+                            })
             
-            return {"buildings": buildings, "count": len(buildings)}
+            return {
+                "type": "FeatureCollection",
+                "data": {
+                    "type": "FeatureCollection",
+                    "features": features
+                }
+            }
         
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"OSM Overpass error: {str(e)[:150]}")
@@ -297,7 +325,7 @@ JSON UNIQUEMENT :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-4-20250514",
             max_tokens=3000,
             messages=[{"role": "user", "content": content}],
         )
@@ -309,12 +337,12 @@ JSON UNIQUEMENT :
             raise HTTPException(status_code=502, detail=f"AI non-JSON: {text[:200]}")
         result = json.loads(m.group(0))
         
-        return {
-            "result": result,
-            "raw": text,
-            "has_image": has_image,
-            "source": "belgian-wms" if (has_image and not req.image_base64) else "frontend",
-        }
+        # Add coordinate mode flag for frontend
+        result["_coord_mode"] = "pixels" if has_image else "meters"
+        result["_has_image"] = has_image
+        result["_source"] = "belgian-wms" if (has_image and not req.image_base64) else ("frontend" if has_image else "gps-only")
+        
+        return result
     
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
@@ -337,10 +365,13 @@ async def detect_edges(req: EdgeDetectRequest):
     zoom = req.zoom or 21
     W, H = 1024, 1024
     
+    # CRITICAL: Image covers 50m real-world (set in fetch_belgian_orthophoto)
+    # NOT 1024m as previously calculated
+    target_width_m = 50
     latM = 111320
     lngM = 111320 * math.cos(math.radians(lat))
-    dlat = (H / 2) / latM
-    dlng = (W / 2) / lngM
+    dlat = (target_width_m / 2) / latM
+    dlng = (target_width_m / 2) / lngM
     
     # Fetch image
     img_bytes = await fetch_belgian_orthophoto(lat, lng, W, H, req.source)
@@ -561,7 +592,7 @@ Réponds UNIQUEMENT en JSON valide :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-4-20250514",
             max_tokens=2000,
             messages=[{"role": "user", "content": content}],
         )
