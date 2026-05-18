@@ -3,8 +3,10 @@
 # Endpoints: /api/cadastre, /api/analyze, /api/detect-edges, /api/refine-footprint
 
 import os
+import json
 import httpx
 import anthropic
+import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -237,6 +239,223 @@ async def get_cadastre(lat: float, lng: float):
             status_code=502,
             detail=f"OSM Overpass error (tried {len(overpass_servers)} servers): {str(last_error)[:150]}"
         )
+
+
+@app.post("/api/analyze-deep")
+async def analyze_roof_deep(req: AnalyzeRequest):
+    """
+    Deep analysis with 3 sequential phases:
+    1. Inventory: identify all buildings in cadastre
+    2. Detail: analyze each building separately with dedicated Claude call
+    3. Validate: reconcile all results and verify consistency
+    
+    Takes 1-3 minutes but produces professional-grade results.
+    """
+    try:
+        # Fetch WMS image
+        region = req.region or detect_region(req.center_lat, req.center_lon)
+        img_base64 = await fetch_wms_image(
+            req.center_lat, req.center_lon, region, req.target_width_m or 50
+        )
+        
+        # PHASE 1: Inventory all buildings
+        inventory_prompt = f"""Tu es un expert en analyse de toitures depuis images aériennes.
+
+MISSION : Inventorie TOUS les bâtiments distincts visibles dans l'emprise cadastrale fournie.
+
+EMPRISE CADASTRALE (polygone orange) :
+{json.dumps(req.cadastre_polygon) if req.cadastre_polygon else "Non fournie"}
+
+Pour CHAQUE bâtiment distinct à l'intérieur de l'emprise :
+1. Assigne un ID unique (1, 2, 3...)
+2. Classe le type : "principal", "annexe", "garage", "extension", "autre"
+3. Décris l'orientation dominante : "N-S", "E-O", "NE-SO", "NO-SE"
+4. Estime la complexité de la toiture :
+   - "simple" : 2 pans symétriques
+   - "moyenne" : 3-4 pans, quelques décrochements
+   - "complexe" : 5+ pans, forme en L/U, multiples faîtages
+5. Note toute particularité visible : lucarnes, toiture terrasse partielle, décrochements
+
+RÈGLES :
+- Ignore les structures HORS emprise cadastrale
+- Sépare les bâtiments clairement distincts (différents volumes, orientations différentes)
+- Un garage accolé = bâtiment séparé si sa toiture est indépendante
+- Toiture continue sur L ou U = 1 seul bâtiment
+
+RETOURNE UNIQUEMENT un objet JSON valide (pas de markdown, pas de texte avant/après) :
+{{
+  "buildings": [
+    {{
+      "id": 1,
+      "type": "principal",
+      "orientation": "E-O",
+      "complexity": "simple",
+      "notes": "Toiture 2 pans classique, tuiles orangées"
+    }}
+  ],
+  "total_buildings": 1
+}}"""
+
+        inventory_response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": img_base64
+                        }
+                    },
+                    {"type": "text", "text": inventory_prompt}
+                ]
+            }]
+        )
+        
+        inventory_text = inventory_response.content[0].text.strip()
+        # Remove markdown fences if present
+        if inventory_text.startswith("```"):
+            inventory_text = inventory_text.split("```")[1]
+            if inventory_text.startswith("json"):
+                inventory_text = inventory_text[4:]
+        inventory = json.loads(inventory_text)
+        
+        # PHASE 2: Detailed analysis per building
+        all_results = []
+        for building in inventory["buildings"]:
+            detail_prompt = f"""Tu es un expert en analyse de toitures depuis images aériennes.
+
+MISSION : Analyse approfondie du bâtiment ID {building['id']} UNIQUEMENT.
+
+CONTEXTE DU BÂTIMENT :
+- Type : {building['type']}
+- Orientation : {building['orientation']}
+- Complexité : {building['complexity']}
+- Notes : {building.get('notes', 'Aucune')}
+
+EMPRISE CADASTRALE (polygone orange) :
+{json.dumps(req.cadastre_polygon) if req.cadastre_polygon else "Non fournie"}
+
+RÈGLES STRICTES :
+1. Concentre-toi UNIQUEMENT sur ce bâtiment, ignore complètement les autres structures visibles
+2. IMPÉRATIF : TOUS les sommets de TOUS les polygones DOIVENT être à l'intérieur de l'emprise cadastrale. Vérifie chaque coin.
+3. Prends le temps d'identifier chaque pan de toiture avec précision
+4. Orientation : utilise les arêtes visibles (faîtages, gouttières). Le Nord est en haut de l'image.
+5. Azimut : 0°=Nord, 90°=Est, 180°=Sud, 270°=Ouest. Précision ±5°.
+6. Si un pan fait <3m², c'est probablement une lucarne → ignore
+7. Fusionne les pans de même pente ET azimut (±10°)
+8. Vérifie 3 fois que les polygones ne sortent PAS du cadastre
+
+RETOURNE UNIQUEMENT un objet JSON valide (pas de markdown, pas de texte avant/après) :
+{{
+  "building_id": {building['id']},
+  "planes": [
+    {{
+      "id": "pan_1",
+      "orientation_deg": 178,
+      "slope_deg": 32,
+      "area_m2": 87.3,
+      "polygon": [[lon1, lat1], [lon2, lat2], ...]
+    }}
+  ],
+  "total_area_m2": 145.6,
+  "confidence": 0.92,
+  "warnings": []
+}}
+
+Les coordonnées des polygones doivent être en longitude/latitude (système GPS).
+"""
+
+            detail_response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=3000,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": img_base64
+                            }
+                        },
+                        {"type": "text", "text": detail_prompt}
+                    ]
+                }]
+            )
+            
+            detail_text = detail_response.content[0].text.strip()
+            if detail_text.startswith("```"):
+                detail_text = detail_text.split("```")[1]
+                if detail_text.startswith("json"):
+                    detail_text = detail_text[4:]
+            detail_result = json.loads(detail_text)
+            all_results.append(detail_result)
+            
+            # Small delay between requests to avoid rate limits
+            await asyncio.sleep(0.5)
+        
+        # PHASE 3: Global validation
+        validation_prompt = f"""Tu es un expert en analyse de toitures depuis images aériennes.
+
+MISSION : Validation globale des analyses de toitures.
+
+RÉSULTATS PAR BÂTIMENT :
+{json.dumps(all_results, indent=2)}
+
+EMPRISE CADASTRALE :
+{json.dumps(req.cadastre_polygon) if req.cadastre_polygon else "Non fournie"}
+
+TÂCHES DE VALIDATION :
+1. Vérifie qu'aucun polygone ne sort de l'emprise cadastrale
+2. Détecte les chevauchements entre toitures (si 2 polygones de bâtiments différents se superposent)
+3. Vérifie la cohérence des surfaces totales (somme plausible pour la zone visible)
+4. Signale les anomalies (orientations improbables, pentes extrêmes >60°, surfaces aberrantes)
+5. Si des corrections sont nécessaires, applique-les
+
+RETOURNE UNIQUEMENT un objet JSON valide :
+{{
+  "validated": true,
+  "buildings": [...],  // Liste complète avec corrections éventuelles
+  "total_area_m2": 255.3,
+  "warnings": [],
+  "corrections_applied": []
+}}"""
+
+        validation_response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": img_base64
+                        }
+                    },
+                    {"type": "text", "text": validation_prompt}
+                ]
+            }]
+        )
+        
+        validation_text = validation_response.content[0].text.strip()
+        if validation_text.startswith("```"):
+            validation_text = validation_text.split("```")[1]
+            if validation_text.startswith("json"):
+                validation_text = validation_text[4:]
+        final_result = json.loads(validation_text)
+        
+        return final_result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/analyze")
