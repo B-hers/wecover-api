@@ -341,7 +341,7 @@ JSON UNIQUEMENT :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-3-5-sonnet-20241022",  # Stable version, accessible with all API keys
+            model="claude-sonnet-4-6",  # Available with API key (verified via /v1/models)
             max_tokens=3000,
             messages=[{"role": "user", "content": content}],
         )
@@ -401,8 +401,30 @@ async def detect_edges(req: EdgeDetectRequest):
     np_img = clahe.apply(np_img)
     blurred = cv2.GaussianBlur(np_img, (5, 5), 1.0)
     
-    # Canny
+    # Canny edge detection
     edges = cv2.Canny(blurred, req.canny_low or 50, req.canny_high or 150, apertureSize=3)
+    
+    # CRITICAL: Apply cadastre mask BEFORE Hough to reduce noise
+    # Create mask from building_footprint polygon (white inside, black outside)
+    if req.building_footprint and len(req.building_footprint) >= 3:
+        mask = np.zeros((H, W), dtype=np.uint8)
+        
+        # Convert cadastre lat/lng to pixel coordinates
+        pts = []
+        for p in req.building_footprint:
+            px = int((p["lng"] - (lng - dlng)) / (2 * dlng) * W)
+            py = int(((lat + dlat) - p["lat"]) / (2 * dlat) * H)
+            pts.append([px, py])
+        
+        pts = np.array(pts, dtype=np.int32)
+        cv2.fillPoly(mask, [pts], 255)  # White inside polygon
+        
+        # Expand mask by 5 pixels to catch edges on boundary
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        
+        # Apply mask: keep only edges inside/near cadastre
+        edges = cv2.bitwise_and(edges, edges, mask=mask)
     
     # Hough
     lines = cv2.HoughLinesP(
@@ -528,6 +550,11 @@ async def detect_edges(req: EdgeDetectRequest):
     keep_lines.sort(key=lambda x: -x["length_m"])
     panel_lines.sort(key=lambda x: -x["length_m"])
     
+    # Limit to top 100 lines to avoid UI overload (thousands of lines)
+    MAX_LINES = 100
+    if len(keep_lines) > MAX_LINES:
+        keep_lines = keep_lines[:MAX_LINES]
+    
     return {
         "lines": keep_lines,
         "panels": panel_lines,
@@ -608,7 +635,7 @@ Réponds UNIQUEMENT en JSON valide :
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-3-5-sonnet-20241022",  # Stable version, accessible with all API keys
+            model="claude-sonnet-4-6",  # Available with API key (verified via /v1/models)
             max_tokens=2000,
             messages=[{"role": "user", "content": content}],
         )
