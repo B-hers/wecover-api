@@ -296,12 +296,12 @@ IMAGE : {req.image_width}×{req.image_height}px, zoom {req.zoom}, centre = pixel
 
 MISSION : Identifie TOUS les pans de toiture du bâtiment principal.
 
-RÈGLES :
-1. Si emprise cadastrale fournie : reste à l'intérieur, couvre l'ensemble.
-2. Pas de limite arbitraire : 2 à 10 pans selon complexité réelle.
-3. Fusionne les pans de même pente ET azimut (±10°).
-4. Ignore annexes, garages, abris hors emprise, lucarnes <5m².
-5. Trace les polygones sur les arêtes visibles.
+RÈGLES STRICTES :
+1. IMPÉRATIF : Si emprise cadastrale fournie, TOUS les sommets de TOUS les polygones DOIVENT être à l'intérieur de cette emprise. AUCUN sommet ne peut sortir. Vérifie chaque coin.
+2. Orientation : utilise les arêtes visibles (faîtages, gouttières) pour déterminer les directions réelles. Le Nord est en haut de l'image.
+3. Pas de limite arbitraire : 2 à 10 pans selon complexité réelle.
+4. Fusionne les pans de même pente ET azimut (±10°).
+5. Ignore annexes, garages, abris hors emprise, lucarnes <5m².
 
 TYPOLOGIES BELGES :
 - Mitoyenne 2 façades : 2 pans
@@ -419,18 +419,18 @@ async def detect_edges(req: EdgeDetectRequest):
         pts = np.array(pts, dtype=np.int32)
         cv2.fillPoly(mask, [pts], 255)  # White inside polygon
         
-        # Expand mask by 5 pixels to catch edges on boundary
-        kernel = np.ones((5, 5), np.uint8)
+        # Expand mask by 15 pixels to catch edges on boundary (was 5, too restrictive)
+        kernel = np.ones((15, 15), np.uint8)
         mask = cv2.dilate(mask, kernel, iterations=1)
         
         # Apply mask: keep only edges inside/near cadastre
         edges = cv2.bitwise_and(edges, edges, mask=mask)
     
-    # Hough
+    # Hough line detection (lowered threshold to 50 to catch more roof edges)
     lines = cv2.HoughLinesP(
         edges, rho=1, theta=np.pi / 180,
-        threshold=req.hough_threshold or 70,
-        minLineLength=req.min_line_px or 25,
+        threshold=req.hough_threshold or 50,  # Was 70, now 50 for better detection
+        minLineLength=req.min_line_px or 20,  # Was 25, now 20 to catch smaller features
         maxLineGap=req.max_line_gap or 10,
     )
     
@@ -609,13 +609,15 @@ POLYGONE OSM ACTUEL (à affiner — {len(fp_meters)} sommets, ~70-80% précis) :
 
 MISSION : Retourne un polygone affiné dont les sommets coïncident PRÉCISÉMENT avec les arêtes externes de la toiture (gouttières, débords, pignons) visibles dans l'image.
 
-RÈGLES :
+RÈGLES STRICTES :
 1. Garde la forme générale du polygone OSM (même topologie L, U, rectangle, etc.)
-2. Ajuste chaque sommet pour qu'il tombe sur une vraie arête de toiture visible
-3. Ajoute des sommets supplémentaires si la toiture a des décrochements non capturés par OSM
-4. Supprime les sommets aberrants (sortie OSM imprécise)
-5. Conserve les angles ~90° quand le bâtiment est orthogonal
-6. Le polygone final doit être fermé (premier sommet = dernier ignoré, le système ferme automatiquement)
+2. Ajuste chaque sommet pour qu'il tombe EXACTEMENT sur une vraie arête de toiture visible (gouttière, débord, pignon)
+3. Utilise les lignes rectilignes des bords de toiture pour placer les sommets avec une précision ±20cm
+4. Ajoute des sommets supplémentaires si la toiture a des décrochements non capturés par OSM
+5. Supprime les sommets aberrants (sortie OSM imprécise)
+6. Conserve les angles ~90° quand le bâtiment est orthogonal
+7. Le polygone final doit être fermé (premier sommet = dernier ignoré, le système ferme automatiquement)
+8. Priorité : PRÉCISION > proximité OSM. Si un sommet OSM est à 2m du vrai bord, corrige-le de 2m.
 
 Réponds UNIQUEMENT en JSON valide :
 {{
