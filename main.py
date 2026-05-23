@@ -253,18 +253,19 @@ async def analyze_roof_deep(req: AnalyzeRequest):
     """
     try:
         # Fetch WMS image
-        region = req.region or detect_region(req.center_lat, req.center_lon)
+        region = req.region or detect_region(req.lat, req.lng)
         img_base64 = await fetch_wms_image(
-            req.center_lat, req.center_lon, region, req.target_width_m or 50
+            req.lat, req.lng, region, 50  # 50m target width
         )
         
         # PHASE 1: Inventory all buildings
+        cadastre_json = json.dumps(req.building_footprint) if req.building_footprint else "Non fournie"
         inventory_prompt = f"""Tu es un expert en analyse de toitures depuis images aériennes.
 
 MISSION : Inventorie TOUS les bâtiments distincts visibles dans l'emprise cadastrale fournie.
 
 EMPRISE CADASTRALE (polygone orange) :
-{json.dumps(req.cadastre_polygon) if req.cadastre_polygon else "Non fournie"}
+{cadastre_json}
 
 Pour CHAQUE bâtiment distinct à l'intérieur de l'emprise :
 1. Assigne un ID unique (1, 2, 3...)
@@ -337,7 +338,7 @@ CONTEXTE DU BÂTIMENT :
 - Notes : {building.get('notes', 'Aucune')}
 
 EMPRISE CADASTRALE (polygone orange) :
-{json.dumps(req.cadastre_polygon) if req.cadastre_polygon else "Non fournie"}
+{cadastre_json}
 
 RÈGLES STRICTES :
 1. Concentre-toi UNIQUEMENT sur ce bâtiment, ignore complètement les autres structures visibles
@@ -408,7 +409,7 @@ RÉSULTATS PAR BÂTIMENT :
 {json.dumps(all_results, indent=2)}
 
 EMPRISE CADASTRALE :
-{json.dumps(req.cadastre_polygon) if req.cadastre_polygon else "Non fournie"}
+{cadastre_json}
 
 TÂCHES DE VALIDATION :
 1. Vérifie qu'aucun polygone ne sort de l'emprise cadastrale
