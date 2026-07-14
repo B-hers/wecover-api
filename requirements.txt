@@ -1,8 +1,8 @@
-fastapi==0.115.6
-uvicorn[standard]==0.32.1
-httpx==0.28.1
-anthropic==0.42.0
-pydantic==2.10.4
-opencv-python-headless==4.10.0.84
-numpy==1.26.4
-pillow==11.0.0
+fastapi
+uvicorn[standard]
+httpx
+anthropic
+pydantic
+opencv-python-headless
+numpy
+pillow

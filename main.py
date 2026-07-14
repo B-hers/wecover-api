@@ -1,4 +1,4 @@
-# WeCover Backend API v0.5.0
+# WeCover Backend API v0.6.0
 # Belgian-only orthophoto sources (Wallonia, Flanders) — no Google Static Maps dependency
 # Endpoints: /api/cadastre, /api/analyze, /api/detect-edges, /api/refine-footprint
 
@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
-app = FastAPI(title="WeCover API", version="0.5.0")
+app = FastAPI(title="WeCover API", version="0.6.0")
 
 # CORS configuration
 app.add_middleware(
@@ -163,9 +163,9 @@ async def fetch_belgian_orthophoto(lat: float, lng: float, width: int, height: i
 async def healthcheck():
     return {
         "service": "WeCover API",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "status": "running",
-        "endpoints": ["/api/cadastre", "/api/analyze", "/api/detect-edges", "/api/refine-footprint"],
+        "endpoints": ["/api/cadastre", "/api/analyze", "/api/analyze-deep", "/api/detect-edges", "/api/refine-footprint"],
     }
 
 
@@ -244,219 +244,265 @@ async def get_cadastre(lat: float, lng: float):
 @app.post("/api/analyze-deep")
 async def analyze_roof_deep(req: AnalyzeRequest):
     """
-    Deep analysis with 3 sequential phases:
-    1. Inventory: identify all buildings in cadastre
-    2. Detail: analyze each building separately with dedicated Claude call
-    3. Validate: reconcile all results and verify consistency
-    
-    Takes 1-3 minutes but produces professional-grade results.
+    Analyse approfondie en 3 phases :
+      1. Inventaire     — Claude liste les batiments distincts dans l'emprise
+      2. Detail         — 1 requete Claude DEDIEE par batiment (coordonnees PIXEL)
+      3. Validation     — geometrie PYTHON : conversion px->GPS exacte,
+                          clamp des sommets dans le cadastre, surfaces recalculees
+
+    Principes cles v0.6.0 :
+      - Le cadastre est DESSINE en orange sur l'image envoyee a Claude
+      - Claude repond en PIXELS (jamais en GPS) -> conversion exacte cote backend
+      - La contrainte cadastre est appliquee mathematiquement, pas par prompt
+      - Les surfaces sont recalculees par shoelace + correction de pente
     """
-    try:
-        # Fetch WMS image
-        region = req.region or detect_region(req.lat, req.lng)
-        img_base64 = await fetch_wms_image(
-            req.lat, req.lng, region, 50  # 50m target width
-        )
-        
-        # PHASE 1: Inventory all buildings
-        cadastre_json = json.dumps(req.building_footprint) if req.building_footprint else "Non fournie"
-        inventory_prompt = f"""Tu es un expert en analyse de toitures depuis images aériennes.
+    import base64, io, math, re
+    from PIL import Image, ImageDraw
 
-MISSION : Inventorie TOUS les bâtiments distincts visibles dans l'emprise cadastrale fournie.
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+    client = anthropic.Anthropic(api_key=api_key)
 
-EMPRISE CADASTRALE (polygone orange) :
-{cadastre_json}
+    lat, lng = req.lat, req.lng
+    W = H = 640
+    TARGET_M = 50.0
+    latM = 111320.0
+    lngM = 111320.0 * math.cos(math.radians(lat))
+    dlat = (TARGET_M / 2) / latM
+    dlng = (TARGET_M / 2) / lngM
 
-Pour CHAQUE bâtiment distinct à l'intérieur de l'emprise :
-1. Assigne un ID unique (1, 2, 3...)
-2. Classe le type : "principal", "annexe", "garage", "extension", "autre"
-3. Décris l'orientation dominante : "N-S", "E-O", "NE-SO", "NO-SE"
-4. Estime la complexité de la toiture :
-   - "simple" : 2 pans symétriques
-   - "moyenne" : 3-4 pans, quelques décrochements
-   - "complexe" : 5+ pans, forme en L/U, multiples faîtages
-5. Note toute particularité visible : lucarnes, toiture terrasse partielle, décrochements
+    # Conversions pixel <-> GPS (lineaires et EXACTES car bbox WMS connu)
+    def px_to_ll(px, py):
+        return (lat + dlat - (py / H) * 2 * dlat,
+                lng - dlng + (px / W) * 2 * dlng)
 
-RÈGLES :
-- Ignore les structures HORS emprise cadastrale
-- Sépare les bâtiments clairement distincts (différents volumes, orientations différentes)
-- Un garage accolé = bâtiment séparé si sa toiture est indépendante
-- Toiture continue sur L ou U = 1 seul bâtiment
+    def ll_to_px(plat, plng):
+        return ((plng - (lng - dlng)) / (2 * dlng) * W,
+                ((lat + dlat) - plat) / (2 * dlat) * H)
 
-RETOURNE UNIQUEMENT un objet JSON valide (pas de markdown, pas de texte avant/après) :
-{{
-  "buildings": [
-    {{
-      "id": 1,
-      "type": "principal",
-      "orientation": "E-O",
-      "complexity": "simple",
-      "notes": "Toiture 2 pans classique, tuiles orangées"
-    }}
-  ],
-  "total_buildings": 1
-}}"""
+    # ------------------------------------------------------------------
+    # 0. Image WMS + cadastre dessine en orange dessus
+    # ------------------------------------------------------------------
+    img_bytes = await fetch_belgian_orthophoto(lat, lng, W, H, req.region or "auto")
 
-        inventory_response = client.messages.create(
+    cadastre_px = []
+    if req.building_footprint and len(req.building_footprint) >= 3:
+        cadastre_px = [ll_to_px(p["lat"], p["lng"]) for p in req.building_footprint]
+
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    if cadastre_px:
+        draw = ImageDraw.Draw(pil)
+        pts = [(x, y) for x, y in cadastre_px]
+        draw.line(pts + [pts[0]], fill=(255, 110, 0), width=4)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=92)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def ask_claude(prompt, max_tokens=2500):
+        msg = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2000,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": img_base64
-                        }
-                    },
-                    {"type": "text", "text": inventory_prompt}
-                ]
-            }]
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                 "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ]}],
         )
-        
-        inventory_text = inventory_response.content[0].text.strip()
-        # Remove markdown fences if present
-        if inventory_text.startswith("```"):
-            inventory_text = inventory_text.split("```")[1]
-            if inventory_text.startswith("json"):
-                inventory_text = inventory_text[4:]
-        inventory = json.loads(inventory_text)
-        
-        # PHASE 2: Detailed analysis per building
-        all_results = []
-        for building in inventory["buildings"]:
-            detail_prompt = f"""Tu es un expert en analyse de toitures depuis images aériennes.
+        text = msg.content[0].text if msg.content else ""
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            raise HTTPException(status_code=502, detail=f"IA non-JSON: {text[:200]}")
+        return json.loads(m.group(0))
 
-MISSION : Analyse approfondie du bâtiment ID {building['id']} UNIQUEMENT.
+    cad_px_str = (
+        json.dumps([[round(x), round(y)] for x, y in cadastre_px])
+        if cadastre_px else "non fournie"
+    )
 
-CONTEXTE DU BÂTIMENT :
-- Type : {building['type']}
-- Orientation : {building['orientation']}
-- Complexité : {building['complexity']}
-- Notes : {building.get('notes', 'Aucune')}
+    # ------------------------------------------------------------------
+    # PHASE 1 — Inventaire des batiments
+    # ------------------------------------------------------------------
+    inv_prompt = f"""Tu analyses une orthophoto aerienne belge de {W}x{H}px couvrant {TARGET_M:.0f}m x {TARGET_M:.0f}m.
+Le Nord est en HAUT. Le polygone ORANGE dessine sur l'image est l'emprise cadastrale du batiment cible.
+Sommets du cadastre en pixels [x,y] : {cad_px_str}
 
-EMPRISE CADASTRALE (polygone orange) :
-{cadastre_json}
+MISSION : liste les volumes de toiture DISTINCTS a l'interieur du polygone orange.
+- Un volume = un ensemble de pans partageant la meme structure (corps principal, annexe, garage...)
+- Ignore tout ce qui est HORS du polygone orange (voisins, jardin, rue)
 
-RÈGLES STRICTES :
-1. Concentre-toi UNIQUEMENT sur ce bâtiment, ignore complètement les autres structures visibles
-2. IMPÉRATIF : TOUS les sommets de TOUS les polygones DOIVENT être à l'intérieur de l'emprise cadastrale. Vérifie chaque coin.
-3. Prends le temps d'identifier chaque pan de toiture avec précision
-4. Orientation : utilise les arêtes visibles (faîtages, gouttières). Le Nord est en haut de l'image.
-5. Azimut : 0°=Nord, 90°=Est, 180°=Sud, 270°=Ouest. Précision ±5°.
-6. Si un pan fait <3m², c'est probablement une lucarne → ignore
-7. Fusionne les pans de même pente ET azimut (±10°)
-8. Vérifie 3 fois que les polygones ne sortent PAS du cadastre
+JSON UNIQUEMENT :
+{{"buildings":[{{"id":1,"type":"principal","orientation":"E-O","complexity":"simple","center_px":[320,300],"notes":"2 pans tuiles"}}]}}"""
 
-RETOURNE UNIQUEMENT un objet JSON valide (pas de markdown, pas de texte avant/après) :
-{{
-  "building_id": {building['id']},
-  "planes": [
-    {{
-      "id": "pan_1",
-      "orientation_deg": 178,
-      "slope_deg": 32,
-      "area_m2": 87.3,
-      "polygon": [[lon1, lat1], [lon2, lat2], ...]
-    }}
-  ],
-  "total_area_m2": 145.6,
-  "confidence": 0.92,
-  "warnings": []
-}}
+    inventory = ask_claude(inv_prompt, 1500)
+    buildings = inventory.get("buildings", []) or [
+        {"id": 1, "type": "principal", "orientation": "?", "complexity": "moyenne",
+         "center_px": [W // 2, H // 2], "notes": ""}
+    ]
 
-Les coordonnées des polygones doivent être en longitude/latitude (système GPS).
-"""
+    # ------------------------------------------------------------------
+    # PHASE 2 — Analyse detaillee par batiment (coordonnees PIXEL)
+    # ------------------------------------------------------------------
+    px_per_m = W / TARGET_M  # ~12.8 px par metre
+    raw_planes = []
+    for b in buildings[:6]:
+        det_prompt = f"""Orthophoto belge {W}x{H}px, {TARGET_M:.0f}m de cote, Nord en HAUT.
+Echelle : 1 metre = {px_per_m:.1f} pixels. Le polygone ORANGE = emprise cadastrale.
+Sommets cadastre (pixels) : {cad_px_str}
 
-            detail_response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=3000,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": img_base64
-                            }
-                        },
-                        {"type": "text", "text": detail_prompt}
-                    ]
-                }]
-            )
-            
-            detail_text = detail_response.content[0].text.strip()
-            if detail_text.startswith("```"):
-                detail_text = detail_text.split("```")[1]
-                if detail_text.startswith("json"):
-                    detail_text = detail_text[4:]
-            detail_result = json.loads(detail_text)
-            all_results.append(detail_result)
-            
-            # Small delay between requests to avoid rate limits
-            await asyncio.sleep(0.5)
-        
-        # PHASE 3: Global validation
-        validation_prompt = f"""Tu es un expert en analyse de toitures depuis images aériennes.
+MISSION : trace precisement CHAQUE pan de toiture du batiment ID {b.get('id')} ({b.get('type','?')}, zone {b.get('center_px')}, complexite {b.get('complexity','?')}). IGNORE les autres batiments.
 
-MISSION : Validation globale des analyses de toitures.
+METHODE :
+1. Repere le faitage (ligne de crete, souvent la ligne la plus claire ou la plus marquee)
+2. Repere les gouttieres (bords bas) et les rives (pignons)
+3. Chaque pan = polygone 4-8 sommets suivant EXACTEMENT ces aretes visibles
+4. pitch_deg : pente estimee (toiture belge typique 30-45, plate <5)
+5. azimuth_deg : direction vers laquelle le pan DESCEND (0=N, 90=E, 180=S, 270=O)
+6. Les sommets doivent rester DANS le polygone orange
 
-RÉSULTATS PAR BÂTIMENT :
-{json.dumps(all_results, indent=2)}
+Pans a exclure : lucarnes <3m2, panneaux solaires (ce sont des objets SUR le pan, pas des pans).
 
-EMPRISE CADASTRALE :
-{cadastre_json}
+JSON UNIQUEMENT, coordonnees en PIXELS [x,y] :
+{{"building_id":{b.get('id')},"planes":[{{"name":"Pan Sud","polygon_px":[[120,200],[300,205],[298,280],[118,275]],"pitch_deg":35,"azimuth_deg":180}}]}}"""
 
-TÂCHES DE VALIDATION :
-1. Vérifie qu'aucun polygone ne sort de l'emprise cadastrale
-2. Détecte les chevauchements entre toitures (si 2 polygones de bâtiments différents se superposent)
-3. Vérifie la cohérence des surfaces totales (somme plausible pour la zone visible)
-4. Signale les anomalies (orientations improbables, pentes extrêmes >60°, surfaces aberrantes)
-5. Si des corrections sont nécessaires, applique-les
+        try:
+            det = ask_claude(det_prompt, 3000)
+            for p in det.get("planes", []):
+                p["_building_id"] = b.get("id", 0)
+                p["_building_type"] = b.get("type", "")
+                raw_planes.append(p)
+        except HTTPException:
+            continue
+        await asyncio.sleep(0.3)
 
-RETOURNE UNIQUEMENT un objet JSON valide :
-{{
-  "validated": true,
-  "buildings": [...],  // Liste complète avec corrections éventuelles
-  "total_area_m2": 255.3,
-  "warnings": [],
-  "corrections_applied": []
-}}"""
+    if not raw_planes:
+        raise HTTPException(status_code=502, detail="IA : aucun pan detecte")
 
-        validation_response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4000,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": img_base64
-                        }
-                    },
-                    {"type": "text", "text": validation_prompt}
-                ]
-            }]
-        )
-        
-        validation_text = validation_response.content[0].text.strip()
-        if validation_text.startswith("```"):
-            validation_text = validation_text.split("```")[1]
-            if validation_text.startswith("json"):
-                validation_text = validation_text[4:]
-        final_result = json.loads(validation_text)
-        
-        return final_result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # ------------------------------------------------------------------
+    # PHASE 3 — Validation GEOMETRIQUE en Python (pas de prompt magique)
+    # ------------------------------------------------------------------
+    # Cadastre en coordonnees metres (origine = centre image)
+    cad_m = [((p["lng"] - lng) * lngM, (p["lat"] - lat) * latM)
+             for p in (req.building_footprint or [])]
+
+    def point_in_poly(x, y, poly):
+        inside = False
+        n = len(poly)
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and \
+               (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def nearest_on_boundary(x, y, poly):
+        best, bd = (x, y), float("inf")
+        n = len(poly)
+        for i in range(n):
+            ax, ay = poly[i]
+            bx, by = poly[(i + 1) % n]
+            dx, dy = bx - ax, by - ay
+            ll2 = dx * dx + dy * dy
+            t = 0.0 if ll2 == 0 else max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / ll2))
+            px_, py_ = ax + t * dx, ay + t * dy
+            d = math.hypot(x - px_, y - py_)
+            if d < bd:
+                bd, best = d, (px_, py_)
+        return best, bd
+
+    def shoelace_m2(pts_m):
+        n = len(pts_m)
+        s = 0.0
+        for i in range(n):
+            x1, y1 = pts_m[i]
+            x2, y2 = pts_m[(i + 1) % n]
+            s += x1 * y2 - x2 * y1
+        return abs(s) / 2.0
+
+    corrections, warnings, out_buildings = [], [], {}
+    total_area = 0.0
+
+    for p in raw_planes:
+        poly_px = p.get("polygon_px") or p.get("polygon") or []
+        if len(poly_px) < 3:
+            continue
+
+        # px -> metres (origine centre)
+        pts_m = []
+        for xy in poly_px:
+            plat, plng = px_to_ll(float(xy[0]), float(xy[1]))
+            pts_m.append(((plng - lng) * lngM, (plat - lat) * latM))
+
+        # CLAMP : tout sommet hors cadastre est projete sur le bord du cadastre
+        clamped = 0
+        if cad_m:
+            fixed = []
+            for (x, y) in pts_m:
+                if point_in_poly(x, y, cad_m):
+                    fixed.append((x, y))
+                else:
+                    (nx, ny), dist = nearest_on_boundary(x, y, cad_m)
+                    fixed.append((nx, ny))
+                    if dist > 0.4:          # tolerance 40cm
+                        clamped += 1
+            pts_m = fixed
+        if clamped:
+            corrections.append(f"{p.get('name','pan')}: {clamped} sommet(s) ramene(s) dans le cadastre")
+
+        area_proj = shoelace_m2(pts_m)
+        if area_proj < 2.0:
+            continue  # pan degenere apres clamp
+
+        pitch = max(0.0, min(60.0, float(p.get("pitch_deg", 30))))
+        area_incl = area_proj / max(math.cos(math.radians(pitch)), 0.5)
+
+        # metres -> GPS
+        poly_ll = [[lng + x / lngM, lat + y / latM] for (x, y) in pts_m]
+
+        bid = p.get("_building_id", 0)
+        out_buildings.setdefault(bid, {
+            "building_id": bid,
+            "type": p.get("_building_type", ""),
+            "planes": [],
+        })
+        out_buildings[bid]["planes"].append({
+            "id": f"b{bid}p{len(out_buildings[bid]['planes']) + 1}",
+            "name": p.get("name", f"Pan {len(out_buildings[bid]['planes']) + 1}"),
+            "orientation_deg": float(p.get("azimuth_deg", 180)) % 360,
+            "slope_deg": pitch,
+            "area_m2": round(area_incl, 1),
+            "area_projected_m2": round(area_proj, 1),
+            "polygon": poly_ll,
+        })
+        total_area += area_incl
+
+    buildings_out = [b for b in out_buildings.values() if b["planes"]]
+    if not buildings_out:
+        raise HTTPException(status_code=502,
+                            detail="Aucun pan valide apres validation geometrique")
+
+    # Coherence : surface projetee totale vs surface cadastre
+    if cad_m:
+        cad_area = shoelace_m2(cad_m)
+        proj_sum = sum(pl["area_projected_m2"] for b in buildings_out for pl in b["planes"])
+        if proj_sum > cad_area * 1.25:
+            warnings.append(f"Surface projetee ({proj_sum:.0f}m2) > cadastre ({cad_area:.0f}m2) : chevauchements probables")
+        elif proj_sum < cad_area * 0.5:
+            warnings.append(f"Surface projetee ({proj_sum:.0f}m2) < 50% du cadastre ({cad_area:.0f}m2) : pans manquants possibles")
+
+    return {
+        "validated": True,
+        "buildings": buildings_out,
+        "total_area_m2": round(total_area, 1),
+        "warnings": warnings,
+        "corrections_applied": corrections,
+        "image_source": "belgian-wms",
+        "n_buildings": len(buildings_out),
+        "n_planes": sum(len(b["planes"]) for b in buildings_out),
+    }
 
 
 @app.post("/api/analyze")
